@@ -1,9 +1,11 @@
 """
-Offline preprocessing script to extract SigLIP and T5-XXL embeddings
+Multi-GPU offline preprocessing script to extract SigLIP and T5-XXL embeddings
 from the robobrain-dex dataset and store them as .pt files.
 
+Each GPU gets an equal shard of the dataset. Uses torchrun for launching.
+
 Usage:
-    python scripts/preprocess_embeddings.py \
+    torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
         --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
         --output_dir /share/project/congsheng/robobrain-dex-siglip-embedding \
         --batch_size 64
@@ -12,14 +14,23 @@ Usage:
 import os
 import argparse
 import glob
-from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from PIL import Image
 from tqdm import tqdm
 
 from models.siglip_encoder import SigLIPEncoder
 from models.text_encoder import T5TextEncoder
+
+
+def setup_distributed():
+    dist.init_process_group(backend="nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return rank, world_size, local_rank
 
 
 def find_all_images(image_dir: str) -> list[dict]:
@@ -54,12 +65,16 @@ def find_all_images(image_dir: str) -> list[dict]:
     return samples
 
 
+def shard_samples(samples: list[dict], rank: int, world_size: int) -> list[dict]:
+    """Split samples evenly across ranks."""
+    return samples[rank::world_size]
+
+
 def process_batch(
     batch_samples: list[dict],
     siglip: SigLIPEncoder,
     text_encoder: T5TextEncoder,
     output_dir: str,
-    device: torch.device,
 ):
     """Process a batch of images and save embeddings."""
     images = []
@@ -98,27 +113,53 @@ def main():
     parser.add_argument("--t5_model", type=str,
                         default="google/t5-xxl-lm-adapt")
     parser.add_argument("--batch_size", type=int, default=32)
-    parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
-    device = torch.device(args.device)
+    rank, world_size, local_rank = setup_distributed()
+    device = torch.device(f"cuda:{local_rank}")
 
-    print("Loading SigLIP...")
+    if rank == 0:
+        print(f"Running on {world_size} GPUs")
+
+    # Each GPU loads its own copy of the encoders
+    if rank == 0:
+        print("Loading SigLIP...")
     siglip = SigLIPEncoder(args.siglip_model).to(device)
 
-    print("Loading T5-XXL...")
+    if rank == 0:
+        print("Loading T5-XXL...")
     text_encoder = T5TextEncoder(args.t5_model).to(device)
 
-    print("Finding images...")
+    # Find and shard data
+    if rank == 0:
+        print("Finding images...")
     samples = find_all_images(args.image_dir)
-    print(f"Found {len(samples)} images")
+    if rank == 0:
+        print(f"Found {len(samples)} total images")
+
+    my_samples = shard_samples(samples, rank, world_size)
+    if rank == 0:
+        print(f"~{len(my_samples)} images per GPU")
+
+    # Synchronize before starting
+    dist.barrier()
 
     # Process in batches
-    for i in tqdm(range(0, len(samples), args.batch_size), desc="Processing"):
-        batch = samples[i:i + args.batch_size]
-        process_batch(batch, siglip, text_encoder, args.output_dir, device)
+    pbar = tqdm(
+        range(0, len(my_samples), args.batch_size),
+        desc=f"GPU {rank}",
+        disable=(rank != 0),
+    )
+    for i in pbar:
+        batch = my_samples[i:i + args.batch_size]
+        process_batch(batch, siglip, text_encoder, args.output_dir)
 
-    print(f"Done! Embeddings saved to {args.output_dir}")
+    # Wait for all ranks to finish
+    dist.barrier()
+    if rank == 0:
+        print(f"Done! Embeddings saved to {args.output_dir}")
+
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":
