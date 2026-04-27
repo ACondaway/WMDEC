@@ -1,5 +1,6 @@
 import os
 import argparse
+import sys
 import yaml
 import torch
 import torch.nn as nn
@@ -8,6 +9,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import GradScaler, autocast
+from tqdm import tqdm
+import matplotlib
+matplotlib.use("Agg")
+from torchvision.utils import make_grid, save_image
+import matplotlib.pyplot as plt
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from models.adapter import ImageAdapter, TextAdapter
 from models.unet import ConditionalUNet
@@ -35,7 +43,24 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def train(config: dict):
+def save_loss_plot(loss_history: dict, plot_dir: str):
+    os.makedirs(plot_dir, exist_ok=True)
+    fig, ax = plt.subplots(figsize=(10, 6))
+    for key, values in loss_history.items():
+        if values:
+            steps, losses_val = zip(*values)
+            ax.plot(steps, losses_val, label=key)
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.set_title("Training Loss Curves")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    fig.savefig(os.path.join(plot_dir, "loss_curve.png"), dpi=150)
+    plt.close(fig)
+
+
+def train(config: dict, resume_path: str = None):
     local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
     is_main = local_rank == 0
@@ -69,9 +94,9 @@ def train(config: dict):
         siglip = SigLIPEncoder(config["model"]["siglip_model"]).to(device)
 
     # DDP wrapping (only trainable modules)
-    img_adapter = DDP(img_adapter, device_ids=[local_rank])
-    txt_adapter = DDP(txt_adapter, device_ids=[local_rank])
-    unet = DDP(unet, device_ids=[local_rank])
+    img_adapter = DDP(img_adapter, device_ids=[local_rank], find_unused_parameters=True)
+    txt_adapter = DDP(txt_adapter, device_ids=[local_rank], find_unused_parameters=True)
+    unet = DDP(unet, device_ids=[local_rank], find_unused_parameters=True)
 
     # ---- Scheduler & Loss ----
     scheduler = DDPMScheduler(
@@ -99,6 +124,24 @@ def train(config: dict):
 
     scaler = GradScaler()
 
+    # ---- Resume from checkpoint ----
+    start_step = 0
+    if resume_path is not None:
+        if is_main:
+            print(f"Resuming from {resume_path}")
+        ckpt = torch.load(resume_path, map_location=device)
+        unet.module.load_state_dict(ckpt["unet"])
+        img_adapter.module.load_state_dict(ckpt["img_adapter"])
+        txt_adapter.module.load_state_dict(ckpt["txt_adapter"])
+        if "optimizer" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer"])
+        if "lr_scheduler" in ckpt:
+            lr_scheduler.load_state_dict(ckpt["lr_scheduler"])
+        if "scaler" in ckpt:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_step = ckpt.get("step", 0)
+        del ckpt
+
     # ---- Dataset ----
     dataset = EmbeddingDataset(
         data_dir=config["data"]["embedding_dir"],
@@ -116,12 +159,16 @@ def train(config: dict):
     )
 
     # ---- Training Loop ----
-    global_step = 0
+    global_step = start_step
     max_steps = config["training"]["max_steps"]
 
+    # Loss history for plotting (main process only)
+    loss_history = {"total": [], "diffusion": [], "semantic": []}
+
     if is_main:
-        print(f"Starting training for {max_steps} steps")
+        print(f"Starting training from step {global_step} for {max_steps} steps")
         print(f"Trainable params: {sum(p.numel() for p in params if p.requires_grad) / 1e6:.1f}M")
+        pbar = tqdm(total=max_steps, initial=global_step, desc="Training", dynamic_ncols=True, miniters=100)
 
     while global_step < max_steps:
         sampler.set_epoch(global_step)
@@ -160,7 +207,7 @@ def train(config: dict):
             if siglip is not None and global_step % config["training"].get("sem_loss_every", 1) == 0:
                 with torch.no_grad():
                     # Approximate x_0 from prediction
-                    alpha_t = scheduler.alphas_cumprod[t].view(-1, 1, 1, 1).to(device)
+                    alpha_t = scheduler.alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
                     x_0_pred = (x_t - torch.sqrt(1 - alpha_t) * eps_pred) / torch.sqrt(alpha_t)
                     x_0_pred = torch.clamp(x_0_pred, -1, 1)
                     img_pred = vae.decode(x_0_pred)
@@ -186,13 +233,59 @@ def train(config: dict):
             global_step += 1
 
             # Logging
-            if is_main and global_step % config["training"]["log_every"] == 0:
-                log_msg = f"Step {global_step}/{max_steps} | loss: {losses['total'].item():.4f}"
-                log_msg += f" | diff: {losses['diffusion'].item():.4f}"
+            if is_main:
+                # Update tqdm
+                postfix = {"loss": f"{losses['total'].item():.4f}", "lr": f"{optimizer.param_groups[0]['lr']:.2e}"}
                 if "semantic" in losses:
-                    log_msg += f" | sem: {losses['semantic'].item():.4f}"
-                log_msg += f" | lr: {optimizer.param_groups[0]['lr']:.2e}"
-                print(log_msg)
+                    postfix["sem"] = f"{losses['semantic'].item():.4f}"
+                pbar.set_postfix(postfix)
+                pbar.update(1)
+
+                # Record loss history
+                if global_step % config["training"]["log_every"] == 0:
+                    loss_history["total"].append((global_step, losses["total"].item()))
+                    loss_history["diffusion"].append((global_step, losses["diffusion"].item()))
+                    if "semantic" in losses:
+                        loss_history["semantic"].append((global_step, losses["semantic"].item()))
+
+                # Update loss plot every 100 steps
+                if global_step % config["training"]["ploy_every"] == 0:
+                    plot_dir = os.path.join(config["training"]["output_dir"], "plots")
+                    save_loss_plot(loss_history, plot_dir)
+
+                if global_step % config["training"]["visualize_every"] == 0:
+                    vis_dir = os.path.join(config["training"]["output_dir"], "visualizations")
+                    os.makedirs(vis_dir, exist_ok=True)
+
+                    with torch.no_grad():
+                        vis_n = min(4, images.shape[0])
+                        vis_images = images[:vis_n]
+                        vis_latent = vae.encode(vis_images)
+                        vis_ctx = context[:vis_n]
+
+                        # Use a low timestep for a cleaner x_0 estimate
+                        vis_t = torch.full((vis_n,), 50, device=device, dtype=torch.long)
+                        vis_noise = torch.randn_like(vis_latent)
+                        vis_x_t = scheduler.q_sample(vis_latent, vis_t, vis_noise)
+
+                        vis_eps_pred = unet(vis_x_t, vis_t, vis_ctx)
+                        alpha_t = scheduler.alphas_cumprod.to(device)[vis_t].view(-1, 1, 1, 1)
+                        vis_x0 = (vis_x_t - torch.sqrt(1 - alpha_t) * vis_eps_pred) / torch.sqrt(alpha_t)
+                        vis_x0 = torch.clamp(vis_x0, -1, 1)
+
+                        pred = vae.decode(vis_x0)
+
+                        # Consistent normalization: VAE output is [-1, 1] -> [0, 1]
+                        gt = (vis_images * 0.5 + 0.5).clamp(0, 1).cpu()
+                        pred = (pred * 0.5 + 0.5).clamp(0, 1).cpu()
+
+                        grid = torch.cat([gt, pred], dim=0)
+                        grid_img = make_grid(grid, nrow=vis_n)
+
+                        save_path = os.path.join(vis_dir, f"step_{global_step}.png")
+                        save_image(grid_img, save_path)
+                    
+                    
 
             # Save checkpoint
             if is_main and global_step % config["training"]["save_every"] == 0:
@@ -211,7 +304,14 @@ def train(config: dict):
 
     # Final save
     if is_main:
-        ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
+        pbar.close()
+
+        # Final loss plot
+        plot_dir = os.path.join(config["training"]["output_dir"], "plots")
+        save_loss_plot(loss_history, plot_dir)
+        print(f"Loss curve saved to {plot_dir}/loss_curve.png")
+
+        ckpt_dir = os.path.join(config["training"]["output_dir"])
         os.makedirs(ckpt_dir, exist_ok=True)
         torch.save({
             "step": global_step,
@@ -227,7 +327,8 @@ def train(config: dict):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, default="configs/base.yaml")
+    parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint .pt file to resume from")
     args = parser.parse_args()
 
     config = load_config(args.config)
-    train(config)
+    train(config, resume_path=args.resume)

@@ -25,8 +25,8 @@ conda activate siglip_decoder
 conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y
 
 # Install dependencies
-pip install transformers diffusers accelerate sentencepiece protobuf
-pip install pillow tqdm pyyaml lpips
+pip install diffusers accelerate sentencepiece protobuf transformers==4.44.2
+pip install pillow tqdm pyyaml lpips matplotlib
 ```
 
 ---
@@ -69,10 +69,10 @@ Extract SigLIP and T5-XXL embeddings from the raw dataset before training.
 **Output:** Embeddings at `/share/project/congsheng/robobrain-dex-siglip-embedding/{Task_name}/episode_XXXXXX/image_X.0.pt`
 
 ```bash
-python scripts/preprocess_embeddings.py \
-    --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
-    --output_dir /share/project/congsheng/robobrain-dex-siglip-embedding \
-    --batch_size 64
+torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
+        --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
+        --output_dir /share/project/congsheng/robobrain-dex-siglip-embedding \
+        --batch_size 64
 ```
 
 Each `.pt` file contains:

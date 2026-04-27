@@ -1,11 +1,11 @@
 model:
   siglip_model: "google/siglip-large-patch16-384"
-  siglip_dim: 1152
+  siglip_dim: 1024
   t5_dim: 4096
   cross_attn_dim: 1024
   num_img_tokens: 8
   adapter_layers: 3
-  model_channels: 256
+  model_channels: 320
   channel_mult: [1, 2, 4, 4]
   num_heads: 8
   vae_name: "stabilityai/sd-vae-ft-mse"
@@ -17,7 +17,7 @@ diffusion:
   schedule: "scaled_linear"
 
 training:
-  batch_size_per_gpu: 8
+  batch_size_per_gpu: 16
   max_steps: 200000
   lr: 1.0e-4
   weight_decay: 0.01
@@ -25,8 +25,10 @@ training:
   lambda_sem: 0.1
   sem_loss_every: 10
   log_every: 100
+  ploy_every: 100
   save_every: 10000
-  output_dir: "outputs"
+  visualize_every: 1000
+  output_dir: "/share/project/congsheng/WMDEC/v1_checkpoints"
 
 data:
   embedding_dir: "/share/project/congsheng/robobrain-dex-siglip-embedding"

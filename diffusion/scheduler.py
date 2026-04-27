@@ -51,8 +51,8 @@ class DDPMScheduler:
         Returns:
             x_t: (B, C, H, W) noisy latent
         """
-        sqrt_alpha = self.sqrt_alphas_cumprod[t].view(-1, 1, 1, 1).to(x_0.device)
-        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod[t].view(-1, 1, 1, 1).to(x_0.device)
+        sqrt_alpha = self.sqrt_alphas_cumprod.to(x_0.device)[t].view(-1, 1, 1, 1)
+        sqrt_one_minus_alpha = self.sqrt_one_minus_alphas_cumprod.to(x_0.device)[t].view(-1, 1, 1, 1)
         return sqrt_alpha * x_0 + sqrt_one_minus_alpha * noise
 
     def sample_timesteps(self, batch_size: int, device: torch.device) -> torch.Tensor:

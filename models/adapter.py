@@ -10,7 +10,7 @@ class ImageAdapter(nn.Module):
 
     def __init__(
         self,
-        siglip_dim: int = 1152,
+        siglip_dim: int = 1024,
         cross_attn_dim: int = 1024,
         num_tokens: int = 8,
         num_layers: int = 3,
