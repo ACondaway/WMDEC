@@ -143,6 +143,7 @@ def train(config: dict, resume_path: str = None):
 
     # ---- Resume ----
     start_step = 0
+    loss_history = None
     if resume_path is not None:
         if is_main:
             print(f"Resuming from {resume_path}")
@@ -156,6 +157,7 @@ def train(config: dict, resume_path: str = None):
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         start_step = ckpt.get("step", 0)
+        loss_history = ckpt.get("loss_history", None)
         del ckpt
 
     # ---- Dataset + Rebalanced Sampler ----
@@ -202,7 +204,8 @@ def train(config: dict, resume_path: str = None):
     # ---- Training Loop ----
     global_step = start_step
     max_steps = config["training"]["max_steps"]
-    loss_history = {"total": [], "diffusion": [], "semantic": []}
+    if loss_history is None:
+        loss_history = {"total": [], "diffusion": [], "semantic": []}
 
     if is_main:
         print(f"Training from step {global_step} / {max_steps}")
@@ -399,6 +402,7 @@ def train(config: dict, resume_path: str = None):
                         "optimizer": optimizer.state_dict(),
                         "lr_scheduler": lr_scheduler.state_dict(),
                         "scaler": scaler.state_dict(),
+                        "loss_history": loss_history,
                     }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
                 else:
                     torch.save({
@@ -408,6 +412,7 @@ def train(config: dict, resume_path: str = None):
                         "optimizer": optimizer.state_dict(),
                         "lr_scheduler": lr_scheduler.state_dict(),
                         "scaler": scaler.state_dict(),
+                        "loss_history": loss_history,
                     }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
 
     if is_main:

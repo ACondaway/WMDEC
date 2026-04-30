@@ -207,6 +207,7 @@ def train(config: dict, resume_path: str = None):
 
     # ---- Resume ----
     start_step = 0
+    loss_history = None
     if resume_path is not None:
         print(f"Resuming from {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
@@ -220,6 +221,7 @@ def train(config: dict, resume_path: str = None):
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         start_step = ckpt.get("step", 0)
+        loss_history = ckpt.get("loss_history", None)
         del ckpt
 
     # ---- Dataset — single-process WeightedRandomSampler ----
@@ -252,7 +254,8 @@ def train(config: dict, resume_path: str = None):
     # ---- Training loop ----
     global_step = start_step
     max_steps = config["training"]["max_steps"]
-    loss_history = {"total": [], "diffusion": [], "semantic": []}
+    if loss_history is None:
+        loss_history = {"total": [], "diffusion": [], "semantic": []}
 
     print(f"Training from step {global_step} / {max_steps}")
     print(f"Trainable params: {sum(p.numel() for p in params if p.requires_grad) / 1e6:.1f}M")
@@ -366,6 +369,7 @@ def train(config: dict, resume_path: str = None):
                         "optimizer": optimizer.state_dict(),
                         "lr_scheduler": lr_scheduler.state_dict(),
                         "scaler": scaler.state_dict(),
+                        "loss_history": loss_history,
                     }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
                 else:
                     torch.save({
@@ -375,6 +379,7 @@ def train(config: dict, resume_path: str = None):
                         "optimizer": optimizer.state_dict(),
                         "lr_scheduler": lr_scheduler.state_dict(),
                         "scaler": scaler.state_dict(),
+                        "loss_history": loss_history,
                     }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
 
     pbar.close()
