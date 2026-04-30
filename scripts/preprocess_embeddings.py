@@ -10,13 +10,13 @@ Usage — single dataset:
         --dataset robobrain-dex \\
         --image_dir /share/project/hotel/.../robobrain-dex \\
         --output_dir /share/project/congsheng/robobrain-dex-qwen-embedding \\
-        --encoder_ckpt /share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt \\
+        --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt \\
         --batch_size 16
 
 Usage — multiple datasets in one launch (sequential, each on all GPUs):
     torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \\
         --config scripts/preprocess_config.yaml \\
-        --encoder_ckpt /share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt
+        --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
 
 preprocess_config.yaml format:
     output_root: /share/project/congsheng/all-embeddings

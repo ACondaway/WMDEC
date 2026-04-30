@@ -1,6 +1,6 @@
 # Qwen Visual Embedding Decoder
 
-Reconstructs high-resolution images from frozen **Qwen2.5-VL-3B** visual backbone embeddings
+Reconstructs high-resolution images from frozen **Qwen3-VL-4B** visual backbone embeddings
 using a **fine-tuned Stable Diffusion XL** latent diffusion model.
 Supports multiple heterogeneous datasets with automatic stats-based rebalancing.
 
@@ -12,18 +12,18 @@ Supports multiple heterogeneous datasets with automatic stats-based rebalancing.
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Encoding (frozen, offline)                                         │
 │                                                                     │
-│  image ──► Qwen2.5-VL-3B Visual Encoder ──► (1024, 1152) patches   │
+│  image ──► Qwen3-VL-4B Visual Encoder ──► (196, 2560) patches      │
 └────────────────────────────────┬────────────────────────────────────┘
                                  │ stored as .pt  (bfloat16)
                                  ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  Training  (trainable: ImageAdapter + SDXL UNet)                    │
 │                                                                     │
-│  (B,1024,1152) patches                                              │
+│  (B, 196, 2560) patches                                             │
 │       │                                                             │
 │       ▼  ImageAdapter                                               │
-│       │  ├─ CrossAttentionPooler  ──► tokens     (B, 16, 2048)      │
-│       │  └─ Pooled MLP            ──► pooled_proj (B, 1280)         │
+│       │  ├─ CrossAttentionPooler  ──► tokens      (B, 16, 2048)     │
+│       │  └─ Pooled MLP            ──► pooled_proj  (B, 1280)        │
 │       │                                                             │
 │       ▼  SDXL UNet2DConditionModel (full fine-tune)                 │
 │       │  encoder_hidden_states = tokens                             │
@@ -42,7 +42,7 @@ Supports multiple heterogeneous datasets with automatic stats-based rebalancing.
 
 | Component | Choice | Reason |
 |-----------|--------|--------|
-| Visual encoder | Qwen2.5-VL-3B (frozen) | Rich spatial patch features (1024 patches × 1152 dim) |
+| Visual encoder | Qwen3.5-VL-4B (frozen) | Rich spatial patch features (196 tokens × 2560 dim; ViT hidden=1024, projected to out_hidden_size=2560) |
 | Adapter | Perceiver cross-attn pooler | Compresses variable-length patches to fixed 16 tokens |
 | Diffusion backbone | SDXL UNet (full fine-tune) | Pretrained priors → high-quality textures immediately |
 | VAE | SDXL VAE (frozen, scale=0.13025) | Matches the SDXL latent space |
@@ -56,7 +56,7 @@ Supports multiple heterogeneous datasets with automatic stats-based rebalancing.
 ```
 project/
 ├── models/
-│   ├── qwen_visual_encoder.py   # Frozen Qwen2.5-VL-3B visual backbone
+│   ├── qwen_visual_encoder.py   # Frozen Qwen3-VL-4B visual backbone
 │   ├── adapter.py               # CrossAttentionPooler → (tokens, pooled_proj)
 │   ├── unet.py                  # SDXLUNet wrapper (UNet2DConditionModel)
 │   └── vae.py                   # SDXL VAE wrapper (scaling_factor auto-read)
@@ -108,19 +108,19 @@ pip install pillow tqdm pyyaml lpips matplotlib qwen-vl-utils
 
 > **Version notes:**
 > - `diffusers >= 0.28` — SDXL `UNet2DConditionModel` and `DDIMScheduler`
-> - `transformers >= 4.45` — `Qwen2_5_VLForConditionalGeneration`
+> - `transformers >= 4.57.0.dev0` — `Qwen3_5ForConditionalGeneration` (Qwen3.5-VL)
 
 ---
 
 ## Step 0 — Extract the Qwen Visual Backbone (once)
 
-Extract only the ViT tower from the full Qwen2.5-VL-3B model (~7 GB) and save it as a
-standalone checkpoint (~600 MB). Run once; the full model can be deleted after.
+Extract only the ViT tower from the full Qwen3.5-VL-4B model (~8 GB) and save it as a
+standalone checkpoint (~900 MB). Run once; the full model can be deleted after.
 
 ```bash
 python scripts/extract_qwen_visual_encoder.py \
-    --model_name Qwen/Qwen2.5-VL-3B-Instruct \
-    --output /share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt
+    --model_name Qwen/Qwen3.5-4B \
+    --output /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
 ```
 
 ---
@@ -137,7 +137,7 @@ torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
     --dataset robobrain-dex \
     --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
     --output_dir /share/project/congsheng/robobrain-dex-qwen-embedding \
-    --encoder_ckpt /share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt \
+    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt \
     --batch_size 16
 ```
 
@@ -146,7 +146,7 @@ torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
 ```bash
 torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
     --config scripts/preprocess_config.yaml \
-    --encoder_ckpt /share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt
+    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
 ```
 
 `scripts/preprocess_config.yaml`:
@@ -168,7 +168,7 @@ datasets:
     {subdir}/.../{frame}.pt   ← {"z_img": Tensor(1024,1152,bfloat16), "dataset_name":str, ...}
 ```
 
-Each `.pt` file: `z_img` has shape `(1024, 1152)` in `bfloat16` (~2 MB/file).
+Each `.pt` file: `z_img` has shape `(196, 2560)` in `bfloat16` (~1.0 MB/file).
 
 ### Statistics output
 

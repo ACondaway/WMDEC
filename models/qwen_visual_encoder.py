@@ -1,16 +1,28 @@
 """
-Frozen Qwen2.5-VL visual encoder (ViT backbone).
+Frozen Qwen3.5 visual encoder (ViT backbone).
 
-Extracts patch-level image features from the Qwen2.5-VL-3B-Instruct visual tower.
-Output shape: (B, N_patches, D) where D=1152 for the 3B model.
+Extracts projected patch features from the Qwen3_5ForConditionalGeneration visual tower.
+
+Architecture (from config.json)
+--------------------------------
+  model_type           : qwen3_5
+  ViT hidden_size      : 1024   (internal transformer hidden dim)
+  out_hidden_size      : 2560   (projected output = text hidden_size; what we store)
+  patch_size           : 16
+  spatial_merge_size   : 2 × 2  →  196 tokens per 448×448 image
+  temporal_patch_size  : 2
+  depth                : 24
+  deepstack_visual_indexes : []  (no DeepStack in this model)
+
+Stored shape per image: (196, 2560)  bfloat16
 
 Usage
 -----
-# Load from full Qwen model (first time / extraction)
-enc = QwenVisualEncoder.from_full_model("Qwen/Qwen2.5-VL-3B-Instruct")
+# One-time extraction from the full model:
+enc = QwenVisualEncoder.from_full_model("Qwen/Qwen3.5-4B")
 
-# Load from standalone checkpoint (after running extract_qwen_visual_encoder.py)
-enc = QwenVisualEncoder.from_standalone("/path/to/qwen_visual_encoder.pt")
+# Subsequent use from standalone checkpoint:
+enc = QwenVisualEncoder.from_standalone("/path/to/qwen3_5_visual_encoder_4b.pt")
 """
 
 import torch
@@ -18,90 +30,84 @@ import torch.nn as nn
 from PIL import Image
 from typing import List, Union
 
+# Tokens per image for fixed 448×448 input:
+#   (448/16)² patches = 784  →  784 / (2×2 spatial merge) = 196 visual tokens
+_TOKENS_PER_IMAGE_448 = 196
+
 
 class QwenVisualEncoder(nn.Module):
-    """Frozen Qwen2.5-VL visual backbone that produces patch embeddings."""
+    """Frozen Qwen3.5 visual backbone producing projected patch features."""
 
-    HIDDEN_SIZE = {
-        "Qwen/Qwen2.5-VL-3B-Instruct": 1152,
-        "Qwen/Qwen2.5-VL-7B-Instruct": 1536,
-    }
-
-    def __init__(self, visual_model, processor, hidden_size: int = 1152):
-        """Use from_full_model() or from_standalone() instead of calling directly."""
+    def __init__(self, visual_model, processor, hidden_size: int = 2560):
+        """Use from_full_model() or from_standalone() — do not call directly."""
         super().__init__()
         self.visual = visual_model
         self.processor = processor
-        self.hidden_size = hidden_size
+        self.hidden_size = hidden_size  # out_hidden_size = 2560
 
         for param in self.visual.parameters():
             param.requires_grad = False
         self.visual.eval()
 
-    @classmethod
-    def from_full_model(cls, model_name: str = "Qwen/Qwen2.5-VL-3B-Instruct"):
-        """Load the visual encoder from the full Qwen2.5-VL model."""
-        from transformers import Qwen2_5_VLForConditionalGeneration, AutoProcessor
+    # ------------------------------------------------------------------
+    # Constructors
+    # ------------------------------------------------------------------
 
-        print(f"Loading full Qwen2.5-VL model: {model_name} ...")
-        full_model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
+    @classmethod
+    def from_full_model(cls, model_name: str = "Qwen/Qwen3.5-4B"):
+        """Extract the visual tower from the full Qwen3_5ForConditionalGeneration model."""
+        from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
+
+        print(f"Loading {model_name} ...")
+        full_model = Qwen3_5ForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=torch.bfloat16,
             device_map="cpu",
         )
         visual = full_model.visual
         processor = AutoProcessor.from_pretrained(model_name)
-        hidden_size = cls.HIDDEN_SIZE.get(model_name, visual.config.hidden_size)
+        out_hidden_size = getattr(
+            full_model.config.vision_config, "out_hidden_size", 2560
+        )
 
-        # Free the rest of the model
         del full_model
         torch.cuda.empty_cache()
 
-        return cls(visual, processor, hidden_size)
+        return cls(visual, processor, out_hidden_size)
 
     @classmethod
     def from_standalone(cls, checkpoint_path: str):
-        """Load from a standalone .pt file saved by extract_qwen_visual_encoder.py."""
+        """
+        Load from a standalone .pt saved by extract_qwen_visual_encoder.py.
+
+        Reconstructs the vision model from the saved vision_config dict using
+        the qwen3_5 module classes.
+        """
         from transformers import AutoProcessor
-        from transformers.models.qwen2_5_vl.modeling_qwen2_5_vl import (
-            Qwen2_5_VisionTransformerPretrainedModel,
-        )
-        from transformers import Qwen2_5_VLConfig
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        vision_cfg = Qwen2_5_VLConfig(**{"vision_config": ckpt["vision_config"]}).vision_config
-        visual = Qwen2_5_VisionTransformerPretrainedModel(vision_cfg)
+        hidden_size = ckpt.get("hidden_size", 2560)
+
+        # Reconstruct vision model from saved config
+        try:
+            from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+            vision_cfg = Qwen3_5VisionConfig(**ckpt["vision_config"])
+            visual = Qwen3_5VisionModel(vision_cfg)
+        except (ImportError, TypeError):
+            # Fallback: load via AutoModel with the full config dict
+            from transformers import AutoConfig, AutoModel
+            cfg = AutoConfig.for_model("qwen3_5", **{"vision_config": ckpt["vision_config"]})
+            visual = AutoModel.from_config(cfg.vision_config)
+
         visual.load_state_dict(ckpt["state_dict"])
         processor = AutoProcessor.from_pretrained(ckpt["processor_name"])
-        hidden_size = ckpt.get("hidden_size", 1152)
 
         return cls(visual, processor, hidden_size)
 
-    def _preprocess(self, images: List[Image.Image], device: torch.device) -> dict:
-        """Preprocess PIL images using the Qwen processor."""
-        inputs = self.processor(
-            images=images,
-            return_tensors="pt",
-            # Fixed size to get deterministic patch count
-            size={"height": 448, "width": 448},
-        )
-        return {k: v.to(device) for k, v in inputs.items() if torch.is_tensor(v)}
-
-    @torch.no_grad()
-    def encode(self, pixel_values: torch.Tensor, image_grid_thw=None) -> torch.Tensor:
-        """
-        Encode preprocessed pixel values to patch embeddings.
-
-        Args:
-            pixel_values: preprocessed tensor from Qwen processor
-            image_grid_thw: grid shape tensor (required by Qwen2.5-VL)
-
-        Returns:
-            patch_embeds: (B, N_patches, D)
-        """
-        out = self.visual(pixel_values, grid_thw=image_grid_thw)
-        # out shape: (B * N_patches, D) -> reshape to (B, N_patches, D)
-        return out
+    # ------------------------------------------------------------------
+    # Encoding
+    # ------------------------------------------------------------------
 
     @torch.no_grad()
     def encode_images(
@@ -110,14 +116,17 @@ class QwenVisualEncoder(nn.Module):
         device: torch.device = None,
     ) -> torch.Tensor:
         """
-        Encode raw PIL images to patch embeddings.
+        Encode PIL images to projected patch features.
+
+        All images are resized to 448×448 before encoding so every call
+        returns a fixed token count of 196.
 
         Args:
             images: single PIL image or list of PIL images
-            device: target device
+            device: target device (defaults to the visual model's device)
 
         Returns:
-            patch_embeds: (B, N_patches, D)
+            patch_features: (B, 196, 2560)  in the dtype of the visual model
         """
         if isinstance(images, Image.Image):
             images = [images]
@@ -125,22 +134,31 @@ class QwenVisualEncoder(nn.Module):
         if device is None:
             device = next(self.visual.parameters()).device
 
+        dtype = next(self.visual.parameters()).dtype
+
         inputs = self.processor(
             images=images,
             return_tensors="pt",
             size={"height": 448, "width": 448},
         )
-        pixel_values = inputs["pixel_values"].to(device, dtype=next(self.visual.parameters()).dtype)
+        pixel_values = inputs["pixel_values"].to(device, dtype=dtype)
         image_grid_thw = inputs.get("image_grid_thw")
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.to(device)
 
-        features = self.visual(pixel_values, grid_thw=image_grid_thw)
-        # features: (total_patches, D). Reshape per image.
-        # For fixed 448x448 input: N_patches = (448/14)^2 = 1024
+        out = self.visual(pixel_values, grid_thw=image_grid_thw)
+
+        # Handle both tensor return and dataclass return (e.g. BaseModelOutput)
+        features = out.last_hidden_state if hasattr(out, "last_hidden_state") else out
+        # features: (B * 196, out_hidden_size)
+
         B = len(images)
-        N = features.shape[0] // B
+        N = features.shape[0] // B  # 196 for 448×448
         return features.view(B, N, self.hidden_size)
 
-    def forward(self, pixel_values: torch.Tensor, image_grid_thw=None) -> torch.Tensor:
-        return self.encode(pixel_values, image_grid_thw)
+    def forward(
+        self,
+        images: Union[List[Image.Image], Image.Image],
+        device: torch.device = None,
+    ) -> torch.Tensor:
+        return self.encode_images(images, device)

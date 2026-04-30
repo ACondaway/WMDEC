@@ -1,7 +1,7 @@
 """
 Image adapter for SDXL conditioning.
 
-Converts Qwen patch embeddings (B, N_patches, 1152) into:
+Converts Qwen patch embeddings (B, N_patches, 2560) into:
   1. tokens     : (B, N_tokens, 2048) — encoder_hidden_states for SDXL UNet cross-attention
   2. pooled_proj: (B, 1280)           — text_embeds for SDXL added_cond_kwargs
 
@@ -60,7 +60,7 @@ class ImageAdapter(nn.Module):
 
     def __init__(
         self,
-        qwen_dim: int = 1152,
+        qwen_dim: int = 2560,
         cross_attn_dim: int = 2048,    # SDXL encoder_hidden_states dim
         pooled_proj_dim: int = 1280,   # SDXL text_embeds dim
         num_tokens: int = 16,
