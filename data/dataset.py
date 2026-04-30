@@ -96,14 +96,18 @@ class EmbeddingDataset(Dataset):
 
     def __getitem__(self, idx: int) -> dict:
         emb_path = self.samples[idx]
-        data = torch.load(emb_path, map_location="cpu", weights_only=True)
+        data = torch.load(emb_path, map_location="cpu", weights_only=False)
 
         result = {
             "z_img": data["z_img"].float(),  # (N_patches, D)
             "dataset_name": self.name,
         }
 
-        img_path = self._image_path(emb_path)
+        # Prefer the absolute path stored in the .pt file by the preprocessor
+        # (_abs_image_path in extra_meta).  The embedding may use a flattened
+        # directory structure that doesn't mirror the source image tree, so
+        # reconstructing via _image_path() would resolve to the wrong location.
+        img_path = data.get("_abs_image_path") or self._image_path(emb_path)
         if img_path and os.path.exists(img_path):
             image = Image.open(img_path).convert("RGB")
             result["image"] = self.transform(image)

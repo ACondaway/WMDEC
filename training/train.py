@@ -113,6 +113,15 @@ def train(config: dict, resume_path: str = None):
         ).to(device)
         qwen_enc.eval()
 
+    # ---- Training mode: full fine-tune or LoRA ----
+    training_mode = config["training"].get("training_mode", "full")
+    if training_mode == "lora":
+        unet.setup_lora(
+            rank=config["training"].get("lora_rank", 64),
+            alpha=config["training"].get("lora_alpha", 64),
+            target_modules=config["training"].get("lora_target_modules", None),
+        )
+
     img_adapter = DDP(img_adapter, device_ids=[local_rank], find_unused_parameters=False)
     unet = DDP(unet, device_ids=[local_rank], find_unused_parameters=False)
 
@@ -121,7 +130,9 @@ def train(config: dict, resume_path: str = None):
     criterion = DiffusionLoss(lambda_sem=config["training"]["lambda_sem"])
 
     # ---- Optimizer ----
-    params = list(img_adapter.parameters()) + list(unet.parameters())
+    # Full mode: train all UNet + adapter weights.
+    # LoRA mode: only LoRA delta weights + adapter (base UNet is frozen).
+    params = list(img_adapter.parameters()) + [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         params, lr=config["training"]["lr"], weight_decay=config["training"]["weight_decay"]
     )
@@ -283,17 +294,34 @@ def train(config: dict, resume_path: str = None):
                     os.makedirs(vis_dir, exist_ok=True)
                     with torch.no_grad():
                         vis_n = min(4, B)
-                        vis_latent = vae.encode(images[:vis_n])
-                        vis_t = torch.full((vis_n,), 50, device=device, dtype=torch.long)
-                        vis_noise = torch.randn_like(vis_latent)
-                        vis_x_t = scheduler.q_sample(vis_latent, vis_t, vis_noise)
-                        vis_eps = unet(vis_x_t, vis_t, tokens[:vis_n], pooled[:vis_n], time_ids[:vis_n])
-                        alpha_t = scheduler.alphas_cumprod.to(device)[vis_t].view(-1, 1, 1, 1)
-                        vis_x0 = (vis_x_t - torch.sqrt(1 - alpha_t) * vis_eps) / torch.sqrt(alpha_t)
-                        vis_x0 = torch.clamp(vis_x0, -1, 1)
-                        pred = vae.decode(vis_x0)
+
+                        # GT: true images from the batch (loaded from image_dir via _abs_image_path).
                         gt = (images[:vis_n] * 0.5 + 0.5).clamp(0, 1).cpu()
-                        pred = (pred * 0.5 + 0.5).clamp(0, 1).cpu()
+
+                        # Recompute conditioning without CFG dropout for a clean sample.
+                        _adapter = img_adapter.module if hasattr(img_adapter, "module") else img_adapter
+                        _unet    = unet.module    if hasattr(unet,    "module") else unet
+                        vis_tokens, vis_pooled = _adapter(z_img_emb[:vis_n])
+                        vis_time_ids = time_ids[:vis_n]
+
+                        # 10-step DDIM — shows what the model has learned.
+                        from diffusers import DDIMScheduler as _DDIMSched
+                        _ddim = _DDIMSched(
+                            num_train_timesteps=1000,
+                            beta_start=0.00085,
+                            beta_end=0.012,
+                            beta_schedule="scaled_linear",
+                            clip_sample=False,
+                            set_alpha_to_one=False,
+                        )
+                        _ddim.set_timesteps(10)
+                        x = torch.randn(vis_n, 4, resolution // 8, resolution // 8, device=device)
+                        for _t in _ddim.timesteps:
+                            _t_b = torch.full((vis_n,), _t, device=device, dtype=torch.long)
+                            _eps = _unet(x, _t_b, vis_tokens, vis_pooled, vis_time_ids)
+                            x = _ddim.step(_eps, _t, x).prev_sample
+                        pred = (vae.decode(x) * 0.5 + 0.5).clamp(0, 1).cpu()
+
                         grid = make_grid(torch.cat([gt, pred], dim=0), nrow=vis_n)
                         save_image(grid, os.path.join(vis_dir, f"step_{global_step}.png"))
 
@@ -361,23 +389,42 @@ def train(config: dict, resume_path: str = None):
             if is_main and global_step % config["training"]["save_every"] == 0:
                 ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
                 os.makedirs(ckpt_dir, exist_ok=True)
-                torch.save({
-                    "step": global_step,
-                    "unet": unet.module.state_dict(),
-                    "img_adapter": img_adapter.module.state_dict(),
-                    "optimizer": optimizer.state_dict(),
-                    "lr_scheduler": lr_scheduler.state_dict(),
-                    "scaler": scaler.state_dict(),
-                }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
+                if training_mode == "lora":
+                    # Save only LoRA delta weights + adapter; base UNet weights unchanged.
+                    lora_dir = os.path.join(ckpt_dir, f"lora_step_{global_step}")
+                    unet.module.save_lora(lora_dir)
+                    torch.save({
+                        "step": global_step,
+                        "img_adapter": img_adapter.module.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "lr_scheduler": lr_scheduler.state_dict(),
+                        "scaler": scaler.state_dict(),
+                    }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
+                else:
+                    torch.save({
+                        "step": global_step,
+                        "unet": unet.module.state_dict(),
+                        "img_adapter": img_adapter.module.state_dict(),
+                        "optimizer": optimizer.state_dict(),
+                        "lr_scheduler": lr_scheduler.state_dict(),
+                        "scaler": scaler.state_dict(),
+                    }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
 
     if is_main:
         pbar.close()
         save_loss_plot(loss_history, os.path.join(config["training"]["output_dir"], "plots"))
-        torch.save({
-            "step": global_step,
-            "unet": unet.module.state_dict(),
-            "img_adapter": img_adapter.module.state_dict(),
-        }, os.path.join(config["training"]["output_dir"], "final.pt"))
+        if training_mode == "lora":
+            unet.module.save_lora(os.path.join(config["training"]["output_dir"], "lora_final"))
+            torch.save({
+                "step": global_step,
+                "img_adapter": img_adapter.module.state_dict(),
+            }, os.path.join(config["training"]["output_dir"], "final.pt"))
+        else:
+            torch.save({
+                "step": global_step,
+                "unet": unet.module.state_dict(),
+                "img_adapter": img_adapter.module.state_dict(),
+            }, os.path.join(config["training"]["output_dir"], "final.pt"))
         print("Training complete!")
 
     cleanup()

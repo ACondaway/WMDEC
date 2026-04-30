@@ -14,6 +14,13 @@ diffusion:
   schedule: "scaled_linear"
 
 training:
+  # "full": train all UNet weights + ImageAdapter
+  # "lora": freeze UNet base, train only LoRA deltas + ImageAdapter (requires peft)
+  training_mode: "full"
+  lora_rank: 64
+  lora_alpha: 64
+  # lora_target_modules: null  # null = default ["to_q","to_k","to_v","to_out.0","to_add_out"]
+
   batch_size_per_gpu: 1
   max_steps: 300000
   lr: 5.0e-5

@@ -15,9 +15,18 @@ import torch
 import torch.nn as nn
 from diffusers import UNet2DConditionModel
 
+# Default LoRA target modules for SDXL UNet attention layers.
+_DEFAULT_LORA_TARGETS = ["to_q", "to_k", "to_v", "to_out.0", "to_add_out"]
+
 
 class SDXLUNet(nn.Module):
-    """Thin wrapper around the pretrained SDXL UNet2DConditionModel."""
+    """
+    Thin wrapper around the pretrained SDXL UNet2DConditionModel.
+
+    Supports two training modes, set via setup_lora() or left at default:
+      full — all UNet weights are trainable (default)
+      lora — base weights frozen; only LoRA delta weights are trainable
+    """
 
     def __init__(
         self,
@@ -32,6 +41,41 @@ class SDXLUNet(nn.Module):
         )
         if gradient_checkpointing:
             self.unet.enable_gradient_checkpointing()
+
+    def setup_lora(
+        self,
+        rank: int = 64,
+        alpha: int = 64,
+        target_modules: list = None,
+    ) -> None:
+        """
+        Freeze the base UNet and inject LoRA adapters into attention projections.
+        Only the LoRA delta weights are trainable afterwards.
+        Requires the `peft` package (pip install peft).
+        """
+        from peft import LoraConfig, get_peft_model
+
+        for p in self.unet.parameters():
+            p.requires_grad = False
+
+        lora_cfg = LoraConfig(
+            r=rank,
+            lora_alpha=alpha,
+            target_modules=target_modules or _DEFAULT_LORA_TARGETS,
+            lora_dropout=0.0,
+            bias="none",
+        )
+        self.unet = get_peft_model(self.unet, lora_cfg)
+        trainable, total = self.unet.get_nb_trainable_parameters()
+        print(f"LoRA: {trainable/1e6:.1f}M trainable / {total/1e6:.1f}M total UNet params")
+
+    def save_lora(self, output_dir: str) -> None:
+        """Save only LoRA delta weights (far smaller than a full checkpoint)."""
+        self.unet.save_pretrained(output_dir)
+
+    def load_lora(self, lora_dir: str) -> None:
+        """Load LoRA weights onto the frozen base model."""
+        self.unet.load_adapter(lora_dir, adapter_name="default")
 
     def forward(
         self,
