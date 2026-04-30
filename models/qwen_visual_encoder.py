@@ -94,31 +94,47 @@ class QwenVisualEncoder(nn.Module):
         """
         Load from a standalone .pt saved by extract_qwen_visual_encoder.py.
 
-        Reconstructs the visual model from the saved vision_config dict using
-        Qwen3_5VisionModel so transformers handles all weight mapping.
+        Uses the saved visual_cls_name / visual_cls_module to reconstruct the
+        exact same class that was inside the full model (e.g.
+        Qwen3_5VisionTransformer), not the generic Qwen3_5VisionModel wrapper
+        whose forward() does not call the merger.
         """
+        import importlib
         from transformers import AutoProcessor
+        from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
 
         ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
         hidden_size = ckpt.get("hidden_size", 2560)
 
-        # Reconstruct vision model from the saved config dict.
-        try:
-            from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+        vision_cfg = Qwen3_5VisionConfig(**ckpt["vision_config"])
+
+        cls_name   = ckpt.get("visual_cls_name")
+        cls_module = ckpt.get("visual_cls_module")
+        if cls_name and cls_module:
+            try:
+                mod = importlib.import_module(cls_module)
+                VisualCls = getattr(mod, cls_name)
+                visual = VisualCls(vision_cfg)
+            except (ImportError, AttributeError) as e:
+                raise RuntimeError(
+                    f"Cannot import {cls_module}.{cls_name} saved in checkpoint: {e}. "
+                    "Re-extract with the same transformers version."
+                ) from e
+        else:
+            # Legacy checkpoint without class info — fall back and warn.
+            import warnings
+            warnings.warn(
+                "Checkpoint has no visual_cls_name — falling back to Qwen3_5VisionModel. "
+                "Re-extract with the updated script if the merger does not run.",
+                stacklevel=2,
+            )
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
-            vision_cfg = Qwen3_5VisionConfig(**ckpt["vision_config"])
             visual = Qwen3_5VisionModel(vision_cfg)
-        except (ImportError, KeyError, TypeError) as e:
-            raise RuntimeError(
-                f"Failed to reconstruct Qwen3_5VisionModel from checkpoint config: {e}. "
-                "Ensure transformers>=4.57.0.dev0 is installed."
-            ) from e
 
         visual.load_state_dict(ckpt["state_dict"])
         visual = visual.to(torch.bfloat16)
 
         processor = AutoProcessor.from_pretrained(ckpt["processor_name"])
-
         return cls(visual, processor, hidden_size)
 
     # ------------------------------------------------------------------
@@ -171,24 +187,38 @@ class QwenVisualEncoder(nn.Module):
 
         # Support both tensor return and dataclass return (BaseModelOutput etc.)
         features = out.last_hidden_state if hasattr(out, "last_hidden_state") else out
-        # Expected: (B * 196, 2560)
+        # features is either:
+        #   (B*196, 2560) — merger already ran inside forward()   [correct]
+        #   (B*784, 1024) — pre-merger raw patches               [needs explicit merge]
 
+        if features.shape[-1] != _FEATURE_DIM:
+            # The forward() did not call the merger (e.g. Qwen3_5VisionModel wrapper).
+            # Find merger at visual.merger or visual.model.merger and call it directly.
+            merger = getattr(self.visual, "merger", None)
+            if merger is None:
+                merger = getattr(getattr(self.visual, "model", None), "merger", None)
+            if merger is None:
+                raise RuntimeError(
+                    f"Visual encoder output dim {features.shape[-1]} != {_FEATURE_DIM} "
+                    f"and no merger found at visual.merger or visual.model.merger. "
+                    f"Re-extract the checkpoint with the updated script."
+                )
+            features = merger(features)   # (B*784, 1024) → (B*196, 2560)
+
+        # Hard shape assertions — contract must hold exactly.
         expected_tokens = B * _TOKENS_PER_IMAGE
         if features.shape[0] != expected_tokens:
             raise RuntimeError(
-                f"Visual encoder returned {features.shape[0]} total tokens "
-                f"but expected {expected_tokens} (B={B} × {_TOKENS_PER_IMAGE} tokens/image). "
-                f"image_grid_thw={image_grid_thw}. "
-                f"Ensure all images are resized to 448×448 before encoding."
+                f"After merger: {features.shape[0]} total tokens "
+                f"but expected {expected_tokens} (B={B} × {_TOKENS_PER_IMAGE}). "
+                f"image_grid_thw={image_grid_thw}."
             )
-        if features.shape[1] != self.hidden_size:
+        if features.shape[1] != _FEATURE_DIM:
             raise RuntimeError(
-                f"Visual encoder output dim {features.shape[1]} != expected "
-                f"{self.hidden_size} (out_hidden_size). "
-                f"The merger projection may not have run — check image_grid_thw."
+                f"After merger: feature dim {features.shape[1]} != {_FEATURE_DIM}."
             )
 
-        return features.view(B, _TOKENS_PER_IMAGE, self.hidden_size)
+        return features.view(B, _TOKENS_PER_IMAGE, _FEATURE_DIM)  # (B, 196, 2560) — guaranteed
 
     def forward(
         self,

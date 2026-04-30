@@ -50,11 +50,21 @@ def extract(model_name: str, output_path: str):
     print(f"Projected out_hidden_size: {out_hidden_size}  (stored as hidden_size)")
     print(f"Visual encoder params    : {sum(p.numel() for p in visual.parameters()) / 1e6:.1f}M")
 
+    # Record the exact class so from_standalone can reconstruct the right type.
+    # model.model.visual is Qwen3_5VisionTransformer (an nn.Module), not
+    # Qwen3_5VisionModel (the PreTrainedModel wrapper).  They have different
+    # forward() implementations: the transformer calls self.merger; the wrapper
+    # may not.  Saving the class lets us import the correct one at load time.
+    visual_cls = type(visual)
+    print(f"Visual class: {visual_cls.__module__}.{visual_cls.__name__}")
+
     torch.save({
-        "state_dict":    visual.state_dict(),
-        "vision_config": vision_config.to_dict(),
-        "hidden_size":   out_hidden_size,   # 2560 — dimension of patch embeddings on disk
-        "processor_name": model_name,
+        "state_dict":      visual.state_dict(),
+        "vision_config":   vision_config.to_dict(),
+        "hidden_size":     out_hidden_size,   # 2560
+        "processor_name":  model_name,
+        "visual_cls_name": visual_cls.__name__,
+        "visual_cls_module": visual_cls.__module__,
     }, output_path)
 
     print(f"Saved standalone visual encoder → {output_path}")
