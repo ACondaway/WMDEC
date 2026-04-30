@@ -77,33 +77,29 @@ class QwenVisualEncoder(nn.Module):
         return cls(visual, processor, out_hidden_size)
 
     @classmethod
-    def from_standalone(cls, checkpoint_path: str):
+    def from_standalone(cls, checkpoint_dir: str):
         """
-        Load from a standalone .pt saved by extract_qwen_visual_encoder.py.
+        Load from a HuggingFace-compatible directory saved by extract_qwen_visual_encoder.py.
 
-        Reconstructs the vision model from the saved vision_config dict using
-        the qwen3_5 module classes.
+        The directory contains config.json + model.safetensors written by
+        visual.save_pretrained(), so AutoModel.from_pretrained() handles all
+        config/weight reconstruction automatically without manual class imports.
         """
-        from transformers import AutoProcessor
+        import json
+        import os
+        from transformers import AutoModel, AutoProcessor
 
-        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        hidden_size = ckpt.get("hidden_size", 2560)
+        # Read out_hidden_size from the metadata file written at extraction time.
+        metadata_path = os.path.join(checkpoint_dir, "metadata.json")
+        if os.path.exists(metadata_path):
+            with open(metadata_path) as f:
+                meta = json.load(f)
+            hidden_size = meta.get("out_hidden_size", 2560)
+        else:
+            hidden_size = 2560
 
-        # Reconstruct vision model from saved config
-        try:
-            from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
-            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
-            print("Reconstructing vision model using qwen3_5's Qwen3_5VisionConfig and Qwen3_5VisionModel classes...")
-            vision_cfg = Qwen3_5VisionConfig(**ckpt["vision_config"])
-            visual = Qwen3_5VisionModel(vision_cfg)
-        except (ImportError, TypeError):
-            # Fallback: load via AutoModel with the full config dict
-            from transformers import AutoConfig, AutoModel
-            cfg = AutoConfig.for_model("qwen3_5", **{"vision_config": ckpt["vision_config"]})
-            visual = AutoModel.from_config(cfg.vision_config)
-
-        visual.load_state_dict(ckpt["state_dict"])
-        processor = AutoProcessor.from_pretrained(ckpt["processor_name"])
+        visual = AutoModel.from_pretrained(checkpoint_dir, torch_dtype=torch.bfloat16)
+        processor = AutoProcessor.from_pretrained(checkpoint_dir)
 
         return cls(visual, processor, hidden_size)
 
