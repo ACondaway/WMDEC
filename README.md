@@ -103,7 +103,7 @@ conda install pytorch torchvision pytorch-cuda=12.1 -c pytorch -c nvidia -y
 
 # Core dependencies
 pip install "diffusers>=0.28.0" accelerate "transformers>=4.45.0"
-pip install pillow tqdm pyyaml lpips matplotlib qwen-vl-utils
+pip install pillow tqdm pyyaml lpips matplotlib qwen-vl-utils peft
 ```
 
 > **Version notes:**
