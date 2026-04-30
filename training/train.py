@@ -24,6 +24,9 @@ from models.qwen_visual_encoder import QwenVisualEncoder
 from diffusion.scheduler import DDPMScheduler
 from training.loss import DiffusionLoss
 from training.cfg import apply_condition_dropout, build_uncond_context
+from training.validate import (
+    build_val_loader, run_fast_validation, run_full_validation, BestCheckpointTracker,
+)
 from data.dataset import MultiDatasetEmbeddingDataset, DistributedWeightedSampler
 
 
@@ -54,16 +57,29 @@ def make_time_ids(batch_size: int, resolution: int, device: torch.device) -> tor
 
 def save_loss_plot(loss_history: dict, plot_dir: str):
     os.makedirs(plot_dir, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    # Left: train + val losses
+    ax = axes[0]
     for key, values in loss_history.items():
+        if not values or key in ("val/cosine_sim", "val/lpips"):
+            continue
+        steps, vals = zip(*values)
+        ls = "--" if key.startswith("val/") else "-"
+        ax.plot(steps, vals, label=key, linestyle=ls)
+    ax.set_xlabel("Step"); ax.set_ylabel("Loss")
+    ax.set_title("Loss Curves"); ax.legend(); ax.grid(True, alpha=0.3)
+
+    # Right: val cosine similarity + LPIPS
+    ax2 = axes[1]
+    for key in ("val/cosine_sim", "val/lpips"):
+        values = loss_history.get(key, [])
         if values:
             steps, vals = zip(*values)
-            ax.plot(steps, vals, label=key)
-    ax.set_xlabel("Step")
-    ax.set_ylabel("Loss")
-    ax.set_title("Training Loss Curves")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+            ax2.plot(steps, vals, label=key, marker="o", markersize=3)
+    ax2.set_xlabel("Step"); ax2.set_ylabel("Metric")
+    ax2.set_title("Validation Metrics"); ax2.legend(); ax2.grid(True, alpha=0.3)
+
     fig.tight_layout()
     fig.savefig(os.path.join(plot_dir, "loss_curve.png"), dpi=150)
     plt.close(fig)
@@ -141,6 +157,16 @@ def train(config: dict, resume_path: str = None):
 
     if is_main:
         print(dataset.dataset_summary())
+
+    # ---- Validation loader (rank-0 only) ----
+    val_loader = None
+    best_tracker = None
+    if is_main and config.get("validation"):
+        val_loader = build_val_loader(config, train_dataset=dataset)
+        best_tracker = BestCheckpointTracker(
+            metric=config["validation"].get("best_metric", "val/cosine_sim")
+        )
+        print(f"Validation loader: {len(val_loader.dataset)} samples")
 
     num_samples_per_epoch = data_cfg.get("num_samples_per_epoch") or len(dataset)
 
@@ -270,6 +296,67 @@ def train(config: dict, resume_path: str = None):
                         pred = (pred * 0.5 + 0.5).clamp(0, 1).cpu()
                         grid = make_grid(torch.cat([gt, pred], dim=0), nrow=vis_n)
                         save_image(grid, os.path.join(vis_dir, f"step_{global_step}.png"))
+
+            # ---- Validation ----
+            val_cfg = config.get("validation", {})
+            if is_main and val_loader is not None:
+                val_every = val_cfg.get("val_every", 5000)
+                val_full_every = val_cfg.get("val_full_every", 0)  # 0 = disabled
+
+                if global_step % val_every == 0:
+                    val_metrics = run_fast_validation(
+                        img_adapter=img_adapter.module,
+                        unet=unet.module,
+                        vae=vae,
+                        qwen_enc=qwen_enc,
+                        scheduler=scheduler,
+                        val_loader=val_loader,
+                        device=device,
+                        lambda_sem=config["training"]["lambda_sem"],
+                    )
+                    loss_history.setdefault("val/loss_diffusion", [])
+                    loss_history.setdefault("val/cosine_sim", [])
+                    loss_history["val/loss_diffusion"].append((global_step, val_metrics["val/loss_diffusion"]))
+                    loss_history["val/cosine_sim"].append((global_step, val_metrics["val/cosine_sim"]))
+
+                    print(
+                        f"\n[Val step {global_step}]  "
+                        f"diff_loss={val_metrics['val/loss_diffusion']:.4f}  "
+                        f"cosine_sim={val_metrics['val/cosine_sim']:.4f}  "
+                        f"total={val_metrics['val/loss_total']:.4f}"
+                    )
+
+                    if best_tracker.update(val_metrics, global_step):
+                        ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
+                        os.makedirs(ckpt_dir, exist_ok=True)
+                        torch.save({
+                            "step": global_step,
+                            "unet": unet.module.state_dict(),
+                            "img_adapter": img_adapter.module.state_dict(),
+                            "val_metrics": val_metrics,
+                        }, os.path.join(ckpt_dir, "best.pt"))
+                        print(
+                            f"  → New best ({val_cfg.get('best_metric', 'val/cosine_sim')}="
+                            f"{best_tracker.best_value:.4f})  saved best.pt"
+                        )
+
+                if val_full_every > 0 and global_step % val_full_every == 0:
+                    full_metrics = run_full_validation(
+                        img_adapter=img_adapter.module,
+                        unet=unet.module,
+                        vae=vae,
+                        val_loader=val_loader,
+                        device=device,
+                        output_dir=config["training"]["output_dir"],
+                        global_step=global_step,
+                        ddim_steps=val_cfg.get("val_ddim_steps", 20),
+                        cfg_scale=val_cfg.get("val_cfg_scale", 2.0),
+                        max_batches=val_cfg.get("val_full_max_batches", 4),
+                    )
+                    if full_metrics["val/lpips"] >= 0:
+                        loss_history.setdefault("val/lpips", [])
+                        loss_history["val/lpips"].append((global_step, full_metrics["val/lpips"]))
+                        print(f"  [Full val]  LPIPS={full_metrics['val/lpips']:.4f}")
 
             if is_main and global_step % config["training"]["save_every"] == 0:
                 ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
