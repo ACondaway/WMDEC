@@ -1,6 +1,6 @@
 model:
   unet_name: "stabilityai/stable-diffusion-xl-base-1.0"
-  qwen_encoder_ckpt: "/share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt"
+  qwen_encoder_ckpt: "/share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt"
   qwen_dim: 2560           # out_hidden_size of Qwen3.5-VL-4B projected ViT output (ViT hidden=1024, projected=2560)
   cross_attn_dim: 2048
   pooled_proj_dim: 1280
@@ -14,7 +14,7 @@ diffusion:
   schedule: "scaled_linear"
 
 training:
-  batch_size_per_gpu: 2
+  batch_size_per_gpu: 1
   max_steps: 300000
   lr: 5.0e-5
   weight_decay: 0.01
@@ -39,7 +39,7 @@ data:
 
   datasets:
     - name: "robobrain-dex"
-      embedding_dir: "/share/project/congsheng/robobrain-dex-qwen-embedding"
+      embedding_dir: "/share/project/congsheng/WMDEC_qwen/robobrain-dex-qwen-embedding/robobrain-dex"
       image_dir: "/share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex"
     # Add more datasets below. Each needs a registered preprocessor in
     # data/preprocessors/__init__.py
