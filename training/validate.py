@@ -91,6 +91,9 @@ def run_fast_validation(
     val_loader: DataLoader,
     device: torch.device,
     lambda_sem: float,
+    output_dir: str = None,
+    global_step: int = 0,
+    n_vis: int = 4,
 ) -> dict:
     """
     Compute diffusion loss and cosine similarity over the val set.
@@ -109,6 +112,7 @@ def run_fast_validation(
     total_diff_loss = 0.0
     total_cos_sim = 0.0
     n_batches = 0
+    vis_saved = False
 
     for batch in val_loader:
         z_img_emb = batch["z_img"].to(device)   # (B, N_patches, D)
@@ -134,6 +138,7 @@ def run_fast_validation(
         diff_loss = F.mse_loss(eps_pred, noise).item()
 
         # Single-step x_0 estimate → cosine sim in Qwen space.
+        x0_pred = None
         if qwen_enc is not None:
             alpha_t = scheduler.alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
             x0_pred = (x_t - (1 - alpha_t).sqrt() * eps_pred) / alpha_t.sqrt()
@@ -152,6 +157,17 @@ def run_fast_validation(
             cos_sim = F.cosine_similarity(z_pred, z_target, dim=-1).mean().item()
         else:
             cos_sim = 0.0
+
+        # Save GT vs x0 reconstruction from the first val batch.
+        if not vis_saved and output_dir is not None and x0_pred is not None:
+            _n = min(n_vis, B)
+            gt_vis   = (images[:_n] * 0.5 + 0.5).clamp(0, 1).cpu()
+            pred_vis = (vae.decode(x0_pred[:_n]) * 0.5 + 0.5).clamp(0, 1).cpu()
+            grid = make_grid(torch.cat([gt_vis, pred_vis], dim=0), nrow=_n)
+            val_vis_dir = os.path.join(output_dir, "val_visualizations")
+            os.makedirs(val_vis_dir, exist_ok=True)
+            save_image(grid, os.path.join(val_vis_dir, f"step_{global_step}.png"))
+            vis_saved = True
 
         total_diff_loss += diff_loss
         total_cos_sim += cos_sim
@@ -288,7 +304,7 @@ def run_full_validation(
             torch.cat([gt_cat[:n_show], pred_cat[:n_show]], dim=0),
             nrow=n_show,
         )
-        vis_dir = os.path.join(output_dir, "val_images")
+        vis_dir = os.path.join(output_dir, "val_visualizations", "full")
         os.makedirs(vis_dir, exist_ok=True)
         save_image(grid, os.path.join(vis_dir, f"step_{global_step}.png"))
 

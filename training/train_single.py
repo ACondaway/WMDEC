@@ -35,7 +35,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from torchvision.utils import make_grid, save_image
-from diffusers import UNet2DConditionModel, DDIMScheduler as _DDIMSched
+from diffusers import UNet2DConditionModel
 from tqdm import tqdm
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -355,6 +355,8 @@ def train(config: dict, resume_path: str = None):
             if global_step % config["training"]["visualize_every"] == 0:
                 vis_dir = os.path.join(config["training"]["output_dir"], "visualizations")
                 os.makedirs(vis_dir, exist_ok=True)
+                img_adapter.eval()
+                unet.eval()
                 with torch.no_grad():
                     vis_n = min(4, B)
                     gt = (images[:vis_n] * 0.5 + 0.5).clamp(0, 1).cpu()
@@ -362,6 +364,8 @@ def train(config: dict, resume_path: str = None):
                     vis_tokens, vis_pooled = img_adapter(z_img_emb[:vis_n])
                     vis_time_ids = make_time_ids(vis_n, resolution, device)
 
+                    # Full DDIM from pure noise — matches inference exactly.
+                    from diffusers import DDIMScheduler as _DDIMSched
                     _ddim = _DDIMSched(
                         num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012,
                         beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False,
@@ -376,6 +380,8 @@ def train(config: dict, resume_path: str = None):
 
                     grid = make_grid(torch.cat([gt, pred], dim=0), nrow=vis_n)
                     save_image(grid, os.path.join(vis_dir, f"step_{global_step}.png"))
+                img_adapter.train()
+                unet.train()
 
             # ---- Checkpoint ----
             if global_step % config["training"]["save_every"] == 0:

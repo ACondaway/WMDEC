@@ -310,19 +310,18 @@ def train(config: dict, resume_path: str = None):
                 if global_step % config["training"]["visualize_every"] == 0:
                     vis_dir = os.path.join(config["training"]["output_dir"], "visualizations")
                     os.makedirs(vis_dir, exist_ok=True)
+                    _adapter = img_adapter.module if hasattr(img_adapter, "module") else img_adapter
+                    _unet    = unet.module    if hasattr(unet,    "module") else unet
+                    _adapter.eval()
+                    _unet.eval()
                     with torch.no_grad():
                         vis_n = min(4, B)
-
-                        # GT: true images from the batch (loaded from image_dir via _abs_image_path).
                         gt = (images[:vis_n] * 0.5 + 0.5).clamp(0, 1).cpu()
 
-                        # Recompute conditioning without CFG dropout for a clean sample.
-                        _adapter = img_adapter.module if hasattr(img_adapter, "module") else img_adapter
-                        _unet    = unet.module    if hasattr(unet,    "module") else unet
                         vis_tokens, vis_pooled = _adapter(z_img_emb[:vis_n])
-                        vis_time_ids = time_ids[:vis_n]
+                        vis_time_ids = make_time_ids(vis_n, resolution, device)
 
-                        # 10-step DDIM — shows what the model has learned.
+                        # Full DDIM from pure noise — matches inference exactly.
                         from diffusers import DDIMScheduler as _DDIMSched
                         _ddim = _DDIMSched(
                             num_train_timesteps=1000,
@@ -342,6 +341,8 @@ def train(config: dict, resume_path: str = None):
 
                         grid = make_grid(torch.cat([gt, pred], dim=0), nrow=vis_n)
                         save_image(grid, os.path.join(vis_dir, f"step_{global_step}.png"))
+                    _adapter.train()
+                    _unet.train()
 
             # ---- Validation ----
             val_cfg = config.get("validation", {})
@@ -359,6 +360,8 @@ def train(config: dict, resume_path: str = None):
                         val_loader=val_loader,
                         device=device,
                         lambda_sem=config["training"]["lambda_sem"],
+                        output_dir=config["training"]["output_dir"],
+                        global_step=global_step,
                     )
                     loss_history["val/loss_diffusion"].append((global_step, val_metrics["val/loss_diffusion"]))
                     loss_history["val/cosine_sim"].append((global_step, val_metrics["val/cosine_sim"]))
