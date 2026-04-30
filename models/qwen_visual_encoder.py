@@ -64,7 +64,8 @@ class QwenVisualEncoder(nn.Module):
             torch_dtype=torch.bfloat16,
             device_map="cpu",
         )
-        visual = full_model.visual
+        # Weight keys are "model.visual.*"; the visual tower lives at model.model.visual.
+        visual = full_model.model.visual
         processor = AutoProcessor.from_pretrained(model_name)
         out_hidden_size = getattr(
             full_model.config.vision_config, "out_hidden_size", 2560

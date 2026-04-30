@@ -33,7 +33,10 @@ def extract(model_name: str, output_path: str):
     )
     processor = AutoProcessor.from_pretrained(model_name)
 
-    visual = model.visual
+    # The outer Qwen3_5ForConditionalGeneration wraps an inner `model` submodule.
+    # Weight keys are prefixed "model.visual.*", so the attribute path is model.model.visual.
+    inner = model.model
+    visual = inner.visual
     vision_config = model.config.vision_config
 
     # Qwen3.5-VL projects ViT features (hidden_size=1024) to out_hidden_size=2560.
