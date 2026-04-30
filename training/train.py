@@ -55,24 +55,31 @@ def make_time_ids(batch_size: int, resolution: int, device: torch.device) -> tor
     return ids.unsqueeze(0).expand(batch_size, -1)
 
 
+_METRIC_KEYS = {"val/cosine_sim", "val/lpips"}
+
+
 def save_loss_plot(loss_history: dict, plot_dir: str):
     os.makedirs(plot_dir, exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
 
-    # Left: train + val losses
+    # Left: train losses (solid, logged every log_every steps) +
+    #       val losses   (dashed, logged every val_every steps).
+    # Each series uses its own recorded step coordinates — no sync required.
     ax = axes[0]
     for key, values in loss_history.items():
-        if not values or key in ("val/cosine_sim", "val/lpips"):
+        if not values or key in _METRIC_KEYS:
             continue
         steps, vals = zip(*values)
-        ls = "--" if key.startswith("val/") else "-"
-        ax.plot(steps, vals, label=key, linestyle=ls)
+        if key.startswith("val/"):
+            ax.plot(steps, vals, label=key, linestyle="--", marker="o", markersize=3)
+        else:
+            ax.plot(steps, vals, label=key, linestyle="-")
     ax.set_xlabel("Step"); ax.set_ylabel("Loss")
     ax.set_title("Loss Curves"); ax.legend(); ax.grid(True, alpha=0.3)
 
-    # Right: val cosine similarity + LPIPS
+    # Right: val metrics (cosine sim + LPIPS), logged every val_every steps.
     ax2 = axes[1]
-    for key in ("val/cosine_sim", "val/lpips"):
+    for key in _METRIC_KEYS:
         values = loss_history.get(key, [])
         if values:
             steps, vals = zip(*values)
@@ -157,7 +164,9 @@ def train(config: dict, resume_path: str = None):
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         start_step = ckpt.get("step", 0)
-        loss_history = ckpt.get("loss_history", None)
+        save_loss_history = config["training"].get("save_loss_history", False)
+        if save_loss_history:
+            loss_history = ckpt.get("loss_history", None)
         del ckpt
 
     # ---- Dataset + Rebalanced Sampler ----
@@ -204,8 +213,14 @@ def train(config: dict, resume_path: str = None):
     # ---- Training Loop ----
     global_step = start_step
     max_steps = config["training"]["max_steps"]
+    save_loss_history = config["training"].get("save_loss_history", False)
     if loss_history is None:
-        loss_history = {"total": [], "diffusion": [], "semantic": []}
+        # Train keys update every log_every steps; val keys update every val_every steps.
+        # They are logged independently — pre-create all keys so iteration is stable.
+        loss_history = {
+            "total": [], "diffusion": [], "semantic": [],
+            "val/loss_diffusion": [], "val/cosine_sim": [], "val/lpips": [],
+        }
 
     if is_main:
         print(f"Training from step {global_step} / {max_steps}")
@@ -345,8 +360,6 @@ def train(config: dict, resume_path: str = None):
                         device=device,
                         lambda_sem=config["training"]["lambda_sem"],
                     )
-                    loss_history.setdefault("val/loss_diffusion", [])
-                    loss_history.setdefault("val/cosine_sim", [])
                     loss_history["val/loss_diffusion"].append((global_step, val_metrics["val/loss_diffusion"]))
                     loss_history["val/cosine_sim"].append((global_step, val_metrics["val/cosine_sim"]))
 
@@ -385,35 +398,27 @@ def train(config: dict, resume_path: str = None):
                         max_batches=val_cfg.get("val_full_max_batches", 4),
                     )
                     if full_metrics["val/lpips"] >= 0:
-                        loss_history.setdefault("val/lpips", [])
                         loss_history["val/lpips"].append((global_step, full_metrics["val/lpips"]))
                         print(f"  [Full val]  LPIPS={full_metrics['val/lpips']:.4f}")
 
             if is_main and global_step % config["training"]["save_every"] == 0:
                 ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
                 os.makedirs(ckpt_dir, exist_ok=True)
+                ckpt_payload = {
+                    "step": global_step,
+                    "img_adapter": img_adapter.module.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "scaler": scaler.state_dict(),
+                }
+                if save_loss_history:
+                    ckpt_payload["loss_history"] = loss_history
                 if training_mode == "lora":
-                    # Save only LoRA delta weights + adapter; base UNet weights unchanged.
                     lora_dir = os.path.join(ckpt_dir, f"lora_step_{global_step}")
                     unet.module.save_lora(lora_dir)
-                    torch.save({
-                        "step": global_step,
-                        "img_adapter": img_adapter.module.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                        "scaler": scaler.state_dict(),
-                        "loss_history": loss_history,
-                    }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
                 else:
-                    torch.save({
-                        "step": global_step,
-                        "unet": unet.module.state_dict(),
-                        "img_adapter": img_adapter.module.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                        "scaler": scaler.state_dict(),
-                        "loss_history": loss_history,
-                    }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
+                    ckpt_payload["unet"] = unet.module.state_dict()
+                torch.save(ckpt_payload, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
 
     if is_main:
         pbar.close()

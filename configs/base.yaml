@@ -34,6 +34,7 @@ training:
   plot_every: 100
   save_every: 10000
   visualize_every: 1000
+  save_loss_history: false   # true = persist loss_history in checkpoints for seamless resume curves
   output_dir: "/share/project/congsheng/WMDEC/v3_sdxl_checkpoints"
 
 data:

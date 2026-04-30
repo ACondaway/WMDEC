@@ -127,19 +127,31 @@ def make_time_ids(batch_size: int, resolution: int, device) -> torch.Tensor:
     return ids.unsqueeze(0).expand(batch_size, -1)
 
 
+_METRIC_KEYS = {"val/cosine_sim", "val/lpips"}
+
+
 def save_loss_plot(loss_history: dict, plot_dir: str):
     os.makedirs(plot_dir, exist_ok=True)
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+
+    # Left: train losses (solid, logged every log_every steps) +
+    #       val losses   (dashed, logged every val_every steps).
+    # Each series uses its own recorded step coordinates — no sync required.
     ax = axes[0]
     for key, values in loss_history.items():
-        if not values or key in ("val/cosine_sim",):
+        if not values or key in _METRIC_KEYS:
             continue
         steps, vals = zip(*values)
-        ax.plot(steps, vals, label=key, linestyle="--" if key.startswith("val/") else "-")
+        if key.startswith("val/"):
+            ax.plot(steps, vals, label=key, linestyle="--", marker="o", markersize=3)
+        else:
+            ax.plot(steps, vals, label=key, linestyle="-")
     ax.set_xlabel("Step"); ax.set_ylabel("Loss")
     ax.set_title("Loss Curves"); ax.legend(); ax.grid(True, alpha=0.3)
+
+    # Right: val metrics (cosine sim + LPIPS), logged every val_every steps.
     ax2 = axes[1]
-    for key in ("val/cosine_sim",):
+    for key in _METRIC_KEYS:
         values = loss_history.get(key, [])
         if values:
             steps, vals = zip(*values)
@@ -221,7 +233,9 @@ def train(config: dict, resume_path: str = None):
         if "scaler" in ckpt:
             scaler.load_state_dict(ckpt["scaler"])
         start_step = ckpt.get("step", 0)
-        loss_history = ckpt.get("loss_history", None)
+        save_loss_history = config["training"].get("save_loss_history", False)
+        if save_loss_history:
+            loss_history = ckpt.get("loss_history", None)
         del ckpt
 
     # ---- Dataset — single-process WeightedRandomSampler ----
@@ -254,8 +268,14 @@ def train(config: dict, resume_path: str = None):
     # ---- Training loop ----
     global_step = start_step
     max_steps = config["training"]["max_steps"]
+    save_loss_history = config["training"].get("save_loss_history", False)
     if loss_history is None:
-        loss_history = {"total": [], "diffusion": [], "semantic": []}
+        # Train keys update every log_every steps; val keys update every val_every steps.
+        # They are logged independently — pre-create all keys so iteration is stable.
+        loss_history = {
+            "total": [], "diffusion": [], "semantic": [],
+            "val/loss_diffusion": [], "val/cosine_sim": [], "val/lpips": [],
+        }
 
     print(f"Training from step {global_step} / {max_steps}")
     print(f"Trainable params: {sum(p.numel() for p in params if p.requires_grad) / 1e6:.1f}M")
@@ -361,26 +381,20 @@ def train(config: dict, resume_path: str = None):
             if global_step % config["training"]["save_every"] == 0:
                 ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
                 os.makedirs(ckpt_dir, exist_ok=True)
+                ckpt_payload = {
+                    "step": global_step,
+                    "img_adapter": img_adapter.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "lr_scheduler": lr_scheduler.state_dict(),
+                    "scaler": scaler.state_dict(),
+                }
+                if save_loss_history:
+                    ckpt_payload["loss_history"] = loss_history
                 if training_mode == "lora":
                     unet.save_lora(os.path.join(ckpt_dir, f"lora_step_{global_step}"))
-                    torch.save({
-                        "step": global_step,
-                        "img_adapter": img_adapter.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                        "scaler": scaler.state_dict(),
-                        "loss_history": loss_history,
-                    }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
                 else:
-                    torch.save({
-                        "step": global_step,
-                        "unet": unet.unet.state_dict(),
-                        "img_adapter": img_adapter.state_dict(),
-                        "optimizer": optimizer.state_dict(),
-                        "lr_scheduler": lr_scheduler.state_dict(),
-                        "scaler": scaler.state_dict(),
-                        "loss_history": loss_history,
-                    }, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
+                    ckpt_payload["unet"] = unet.unet.state_dict()
+                torch.save(ckpt_payload, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
 
     pbar.close()
     save_loss_plot(loss_history, os.path.join(config["training"]["output_dir"], "plots"))
