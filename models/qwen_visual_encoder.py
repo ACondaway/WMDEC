@@ -93,6 +93,7 @@ class QwenVisualEncoder(nn.Module):
         try:
             from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
             from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+            print("Reconstructing vision model using qwen3_5's Qwen3_5VisionConfig and Qwen3_5VisionModel classes...")
             vision_cfg = Qwen3_5VisionConfig(**ckpt["vision_config"])
             visual = Qwen3_5VisionModel(vision_cfg)
         except (ImportError, TypeError):
@@ -137,10 +138,10 @@ class QwenVisualEncoder(nn.Module):
 
         dtype = next(self.visual.parameters()).dtype
 
-        inputs = self.processor(
+        inputs = self.processor.image_processor(
             images=images,
             return_tensors="pt",
-            size={"height": 448, "width": 448},
+            size={"shortest_edge": 448, "longest_edge": 448},
         )
         pixel_values = inputs["pixel_values"].to(device, dtype=dtype)
         image_grid_thw = inputs.get("image_grid_thw")
@@ -148,10 +149,14 @@ class QwenVisualEncoder(nn.Module):
             image_grid_thw = image_grid_thw.to(device)
 
         out = self.visual(pixel_values, grid_thw=image_grid_thw)
+        print(out.keys())  # debug
 
         # Handle both tensor return and dataclass return (e.g. BaseModelOutput)
         features = out.last_hidden_state if hasattr(out, "last_hidden_state") else out
         # features: (B * 196, out_hidden_size)
+
+        # debug
+        print(features.shape)
 
         B = len(images)
         N = features.shape[0] // B  # 196 for 448×448
