@@ -1,6 +1,6 @@
 model:
   unet_name: "stabilityai/stable-diffusion-xl-base-1.0"
-  qwen_encoder_ckpt: "/share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b"
+  qwen_encoder_ckpt: "/share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt"
   qwen_dim: 2560           # out_hidden_size of Qwen3.5-VL-4B projected ViT output (ViT hidden=1024, projected=2560)
   cross_attn_dim: 2048
   pooled_proj_dim: 1280

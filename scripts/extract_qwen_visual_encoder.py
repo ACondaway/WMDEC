@@ -1,41 +1,36 @@
 """
 Extract the visual encoder (ViT backbone) from the full Qwen3.5-VL-4B model and save it
-as a HuggingFace-compatible checkpoint directory.
+as a standalone .pt checkpoint.
 
-The output directory contains:
-  config.json          ← vision model config (loadable by AutoModel.from_pretrained)
-  model.safetensors    ← visual model weights
-  preprocessor_config.json  ← processor config
-  tokenizer* files     ← processor tokenizer files
-  metadata.json        ← out_hidden_size and other facts about the stored features
+The checkpoint contains:
+  state_dict    : visual model weights
+  vision_config : vision config dict (used to reconstruct Qwen3_5VisionModel)
+  hidden_size   : out_hidden_size = 2560 (dimension of stored patch features)
+  processor_name: HuggingFace model ID used to reload the processor
 
-Run ONCE. The resulting directory is used by preprocess_embeddings.py and
+Run ONCE. The resulting .pt is used by preprocess_embeddings.py and
 QwenVisualEncoder.from_standalone().
 
 Model facts (from config.json):
   model_type           : qwen3_5
-  ViT hidden_size      : 1024   (internal transformer hidden dim)
-  out_hidden_size      : 2560   (projected output = text hidden_size)
+  ViT hidden_size      : 1024   (internal transformer dim)
+  out_hidden_size      : 2560   (merger projection output = stored feature dim)
   depth                : 24
   patch_size           : 16
-  spatial_merge_size   : 2×2  →  196 tokens per 448×448 image
+  spatial_merge_size   : 2  →  196 tokens per 448×448 image
 
 Usage:
     python scripts/extract_qwen_visual_encoder.py \\
         --model_name Qwen/Qwen3.5-4B \\
-        --output /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b
+        --output /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
 """
 
 import argparse
-import json
-import os
 import torch
 from transformers import Qwen3_5ForConditionalGeneration, AutoProcessor
 
 
-def extract(model_name: str, output_dir: str):
-    os.makedirs(output_dir, exist_ok=True)
-
+def extract(model_name: str, output_path: str):
     print(f"Loading {model_name} ...")
     model = Qwen3_5ForConditionalGeneration.from_pretrained(
         model_name,
@@ -44,8 +39,8 @@ def extract(model_name: str, output_dir: str):
     )
     processor = AutoProcessor.from_pretrained(model_name)
 
-    # The outer Qwen3_5ForConditionalGeneration wraps an inner `model` submodule.
-    # Weight keys are prefixed "model.visual.*", so the attribute path is model.model.visual.
+    # Weight keys are prefixed "model.visual.*" so the visual tower
+    # lives at model.model.visual (not model.visual).
     visual = model.model.visual
     vision_config = model.config.vision_config
 
@@ -55,23 +50,14 @@ def extract(model_name: str, output_dir: str):
     print(f"Projected out_hidden_size: {out_hidden_size}  (stored as hidden_size)")
     print(f"Visual encoder params    : {sum(p.numel() for p in visual.parameters()) / 1e6:.1f}M")
 
-    # Save as a proper HuggingFace checkpoint so AutoModel.from_pretrained() can load it.
-    print(f"Saving visual model to {output_dir} ...")
-    visual.save_pretrained(output_dir)
-    processor.save_pretrained(output_dir)
+    torch.save({
+        "state_dict":    visual.state_dict(),
+        "vision_config": vision_config.to_dict(),
+        "hidden_size":   out_hidden_size,   # 2560 — dimension of patch embeddings on disk
+        "processor_name": model_name,
+    }, output_path)
 
-    # Save extra metadata that consumers need (out_hidden_size, tokens/image).
-    metadata = {
-        "out_hidden_size": out_hidden_size,
-        "vit_hidden_size": vit_hidden_size,
-        "tokens_per_image_448": 196,
-        "source_model": model_name,
-    }
-    with open(os.path.join(output_dir, "metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
-
-    print(f"Saved standalone visual encoder → {output_dir}")
-    print("Contents:", os.listdir(output_dir))
+    print(f"Saved standalone visual encoder → {output_path}")
     print("The full model weights can now be deleted to free disk space.")
 
 
@@ -83,7 +69,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--output", type=str, required=True,
-        help="Output directory for the HuggingFace-compatible visual encoder checkpoint",
+        help="Output path for the standalone .pt checkpoint",
     )
     args = parser.parse_args()
     extract(args.model_name, args.output)

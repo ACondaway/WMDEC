@@ -7,22 +7,25 @@ Architecture (from config.json)
 --------------------------------
   model_type           : qwen3_5
   ViT hidden_size      : 1024   (internal transformer hidden dim)
-  out_hidden_size      : 2560   (projected output = text hidden_size; what we store)
+  out_hidden_size      : 2560   (merger projection output; what gets stored)
   patch_size           : 16
-  spatial_merge_size   : 2 × 2  →  196 tokens per 448×448 image
   temporal_patch_size  : 2
+  spatial_merge_size   : 2  →  196 tokens per 448×448 image
   depth                : 24
-  deepstack_visual_indexes : []  (no DeepStack in this model)
+
+Token count for 448×448:
+  raw patches  : (448/16)² = 784
+  after 2×2 merge : 784/4 = 196 tokens
 
 Stored shape per image: (196, 2560)  bfloat16
 
 Usage
 -----
-# One-time extraction from the full model:
-enc = QwenVisualEncoder.from_full_model("Qwen/Qwen3.5-4B")
-
-# Subsequent use from standalone checkpoint:
+# Load from standalone checkpoint (preferred):
 enc = QwenVisualEncoder.from_standalone("/path/to/qwen3_5_visual_encoder_4b.pt")
+
+# Or extract directly from the full model:
+enc = QwenVisualEncoder.from_full_model("Qwen/Qwen3.5-4B")
 """
 
 import torch
@@ -30,20 +33,30 @@ import torch.nn as nn
 from PIL import Image
 from typing import List, Union
 
-# Tokens per image for fixed 448×448 input:
-#   (448/16)² patches = 784  →  784 / (2×2 spatial merge) = 196 visual tokens
-_TOKENS_PER_IMAGE_448 = 196
+# Fixed output shape contract:
+#   input  : 448×448 RGB image
+#   output : (196, 2560) patch features
+# 448/16 = 28 patches per side → 28×28 = 784 → 2×2 spatial merge → 196 tokens
+# 1024 ViT hidden dim → merger projects to out_hidden_size = 2560
+_INPUT_SIZE = 448
+_TOKENS_PER_IMAGE = 196
+_FEATURE_DIM = 2560
 
 
 class QwenVisualEncoder(nn.Module):
     """Frozen Qwen3.5 visual backbone producing projected patch features."""
 
-    def __init__(self, visual_model, processor, hidden_size: int = 2560):
+    def __init__(self, visual_model, processor, hidden_size: int = _FEATURE_DIM):
         """Use from_full_model() or from_standalone() — do not call directly."""
         super().__init__()
+        if hidden_size != _FEATURE_DIM:
+            raise ValueError(
+                f"hidden_size={hidden_size} but contract requires {_FEATURE_DIM}. "
+                "Re-extract the visual encoder from the correct Qwen3.5-4B checkpoint."
+            )
         self.visual = visual_model
         self.processor = processor
-        self.hidden_size = hidden_size  # out_hidden_size = 2560
+        self.hidden_size = hidden_size
 
         for param in self.visual.parameters():
             param.requires_grad = False
@@ -77,29 +90,34 @@ class QwenVisualEncoder(nn.Module):
         return cls(visual, processor, out_hidden_size)
 
     @classmethod
-    def from_standalone(cls, checkpoint_dir: str):
+    def from_standalone(cls, checkpoint_path: str):
         """
-        Load from a HuggingFace-compatible directory saved by extract_qwen_visual_encoder.py.
+        Load from a standalone .pt saved by extract_qwen_visual_encoder.py.
 
-        The directory contains config.json + model.safetensors written by
-        visual.save_pretrained(), so AutoModel.from_pretrained() handles all
-        config/weight reconstruction automatically without manual class imports.
+        Reconstructs the visual model from the saved vision_config dict using
+        Qwen3_5VisionModel so transformers handles all weight mapping.
         """
-        import json
-        import os
-        from transformers import AutoModel, AutoProcessor
+        from transformers import AutoProcessor
 
-        # Read out_hidden_size from the metadata file written at extraction time.
-        metadata_path = os.path.join(checkpoint_dir, "metadata.json")
-        if os.path.exists(metadata_path):
-            with open(metadata_path) as f:
-                meta = json.load(f)
-            hidden_size = meta.get("out_hidden_size", 2560)
-        else:
-            hidden_size = 2560
+        ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+        hidden_size = ckpt.get("hidden_size", 2560)
 
-        visual = AutoModel.from_pretrained(checkpoint_dir, torch_dtype=torch.bfloat16)
-        processor = AutoProcessor.from_pretrained(checkpoint_dir)
+        # Reconstruct vision model from the saved config dict.
+        try:
+            from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5VisionConfig
+            from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5VisionModel
+            vision_cfg = Qwen3_5VisionConfig(**ckpt["vision_config"])
+            visual = Qwen3_5VisionModel(vision_cfg)
+        except (ImportError, KeyError, TypeError) as e:
+            raise RuntimeError(
+                f"Failed to reconstruct Qwen3_5VisionModel from checkpoint config: {e}. "
+                "Ensure transformers>=4.57.0.dev0 is installed."
+            ) from e
+
+        visual.load_state_dict(ckpt["state_dict"])
+        visual = visual.to(torch.bfloat16)
+
+        processor = AutoProcessor.from_pretrained(ckpt["processor_name"])
 
         return cls(visual, processor, hidden_size)
 
@@ -116,8 +134,9 @@ class QwenVisualEncoder(nn.Module):
         """
         Encode PIL images to projected patch features.
 
-        All images are resized to 448×448 before encoding so every call
-        returns a fixed token count of 196.
+        Images are resized to exactly 448×448 before encoding so every call
+        produces a fixed token count of 196 and the merger receives the correct
+        grid_thw from the image processor.
 
         Args:
             images: single PIL image or list of PIL images
@@ -129,34 +148,47 @@ class QwenVisualEncoder(nn.Module):
         if isinstance(images, Image.Image):
             images = [images]
 
+        B = len(images)
+
         if device is None:
             device = next(self.visual.parameters()).device
 
         dtype = next(self.visual.parameters()).dtype
 
-        inputs = self.processor.image_processor(
-            images=images,
-            return_tensors="pt",
-            size={"shortest_edge": 448, "longest_edge": 448},
-        )
-        pixel_values = inputs["pixel_values"].to(device, dtype=dtype)
-        image_grid_thw = inputs.get("image_grid_thw")
+        # Resize to exactly 448×448 so the image_processor produces the expected
+        # grid_thw ([T, H, W] patch grid) that the visual merger requires.
+        images_448 = [img.convert("RGB").resize((_INPUT_SIZE, _INPUT_SIZE), Image.BICUBIC) for img in images]
+
+        # Call the image_processor directly (bypasses text tokenizer) to get
+        # pixel_values and image_grid_thw.
+        proc_out = self.processor.image_processor(images=images_448, return_tensors="pt")
+        pixel_values = proc_out["pixel_values"].to(device, dtype=dtype)
+        image_grid_thw = proc_out.get("image_grid_thw")
         if image_grid_thw is not None:
             image_grid_thw = image_grid_thw.to(device)
 
         out = self.visual(pixel_values, grid_thw=image_grid_thw)
-        print(out.keys())  # debug
 
-        # Handle both tensor return and dataclass return (e.g. BaseModelOutput)
+        # Support both tensor return and dataclass return (BaseModelOutput etc.)
         features = out.last_hidden_state if hasattr(out, "last_hidden_state") else out
-        # features: (B * 196, out_hidden_size)
+        # Expected: (B * 196, 2560)
 
-        # debug
-        print(features.shape)
+        expected_tokens = B * _TOKENS_PER_IMAGE
+        if features.shape[0] != expected_tokens:
+            raise RuntimeError(
+                f"Visual encoder returned {features.shape[0]} total tokens "
+                f"but expected {expected_tokens} (B={B} × {_TOKENS_PER_IMAGE} tokens/image). "
+                f"image_grid_thw={image_grid_thw}. "
+                f"Ensure all images are resized to 448×448 before encoding."
+            )
+        if features.shape[1] != self.hidden_size:
+            raise RuntimeError(
+                f"Visual encoder output dim {features.shape[1]} != expected "
+                f"{self.hidden_size} (out_hidden_size). "
+                f"The merger projection may not have run — check image_grid_thw."
+            )
 
-        B = len(images)
-        N = features.shape[0] // B  # 196 for 448×448
-        return features.view(B, N, self.hidden_size)
+        return features.view(B, _TOKENS_PER_IMAGE, self.hidden_size)
 
     def forward(
         self,

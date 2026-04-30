@@ -120,7 +120,7 @@ standalone checkpoint (~900 MB). Run once; the full model can be deleted after.
 ```bash
 python scripts/extract_qwen_visual_encoder.py \
     --model_name Qwen/Qwen3.5-4B \
-    --output /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b
+    --output /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt
 ```
 
 ---
@@ -137,7 +137,7 @@ torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
     --dataset robobrain-dex \
     --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
     --output_dir /share/project/congsheng/WMDEC_qwen/robobrain-dex-qwen-embedding \
-    --encoder_ckpt /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b \
+    --encoder_ckpt /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt \
     --batch_size 16
 ```
 
@@ -146,7 +146,7 @@ torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
 ```bash
 torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
     --config scripts/preprocess_config.yaml \
-    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b
+    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
 ```
 
 `scripts/preprocess_config.yaml`:
