@@ -1,0 +1,15 @@
+# Multi-dataset preprocessing config for preprocess_embeddings.py
+# Embeddings are stored under: {output_root}/{dataset_name}/...
+
+output_root: /share/project/congsheng/all-qwen-embeddings
+
+datasets:
+  - name: robobrain-dex
+    image_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex
+
+  # Add more datasets here. Each `name` must be registered in
+  # data/preprocessors/__init__.py. Implement BaseDatasetPreprocessor
+  # and add to the PREPROCESSORS dict.
+  #
+  # - name: my_new_dataset
+  #   image_dir: /share/.../my_new_dataset

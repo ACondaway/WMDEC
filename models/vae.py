@@ -4,14 +4,17 @@ from diffusers import AutoencoderKL
 
 
 class VAEWrapper(nn.Module):
-    """Wrapper around a pretrained VAE for encoding/decoding images to/from latent space."""
+    """
+    Wrapper around the SDXL VAE for encoding/decoding images to/from latent space.
 
-    def __init__(self, model_name: str = "stabilityai/sd-vae-ft-mse"):
+    SDXL VAE scaling factor: 0.13025 (different from SD 1.x/2.x's 0.18215).
+    """
+
+    def __init__(self, model_name: str = "stabilityai/stable-diffusion-xl-base-1.0"):
         super().__init__()
-        self.vae = AutoencoderKL.from_pretrained(model_name)
-        self.scaling_factor = 0.18215
+        self.vae = AutoencoderKL.from_pretrained(model_name, subfolder="vae")
+        self.scaling_factor = self.vae.config.scaling_factor  # 0.13025 for SDXL
 
-        # Freeze VAE
         for param in self.vae.parameters():
             param.requires_grad = False
         self.vae.eval()
@@ -19,32 +22,23 @@ class VAEWrapper(nn.Module):
     @torch.no_grad()
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """
-        Encode image to latent space.
-
         Args:
-            x: (B, 3, H, W) image tensor in [-1, 1]
-
+            x: (B, 3, H, W) in [-1, 1]
         Returns:
             latent: (B, 4, H/8, W/8)
         """
         posterior = self.vae.encode(x).latent_dist
-        latent = posterior.sample() * self.scaling_factor
-        return latent
+        return posterior.sample() * self.scaling_factor
 
     @torch.no_grad()
     def decode(self, latent: torch.Tensor) -> torch.Tensor:
         """
-        Decode latent to image.
-
         Args:
             latent: (B, 4, H/8, W/8)
-
         Returns:
             image: (B, 3, H, W) in [-1, 1]
         """
-        latent = latent / self.scaling_factor
-        image = self.vae.decode(latent).sample
-        return image
+        return self.vae.decode(latent / self.scaling_factor).sample
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.encode(x)

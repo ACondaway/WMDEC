@@ -1,67 +1,101 @@
+"""
+Image adapter for SDXL conditioning.
+
+Converts Qwen patch embeddings (B, N_patches, 1152) into:
+  1. tokens     : (B, N_tokens, 2048) — encoder_hidden_states for SDXL UNet cross-attention
+  2. pooled_proj: (B, 1280)           — text_embeds for SDXL added_cond_kwargs
+
+Uses a Perceiver-style cross-attention pooler so N_patches can vary at runtime.
+"""
+
 import torch
 import torch.nn as nn
 
 
+class CrossAttentionPooler(nn.Module):
+    """
+    N_tokens learned queries attend over N_patches patch embeddings.
+    Output: (B, N_tokens, out_dim).
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, num_tokens: int, num_heads: int = 8):
+        super().__init__()
+        self.num_tokens = num_tokens
+        self.num_heads = num_heads
+        self.head_dim = out_dim // num_heads
+        self.scale = self.head_dim ** -0.5
+
+        self.queries = nn.Parameter(torch.randn(1, num_tokens, out_dim) * 0.02)
+        self.kv_proj = nn.Linear(in_dim, out_dim * 2, bias=False)
+        self.out_proj = nn.Linear(out_dim, out_dim)
+        self.norm_in = nn.LayerNorm(in_dim)
+        self.norm_out = nn.LayerNorm(out_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        x = self.norm_in(x)
+
+        kv = self.kv_proj(x)
+        k, v = kv.chunk(2, dim=-1)
+        q = self.queries.expand(B, -1, -1)
+
+        H, D = self.num_heads, self.head_dim
+        q = q.view(B, self.num_tokens, H, D).permute(0, 2, 1, 3)
+        k = k.view(B, -1, H, D).permute(0, 2, 1, 3)
+        v = v.view(B, -1, H, D).permute(0, 2, 1, 3)
+
+        attn = torch.matmul(q, k.transpose(-2, -1)) * self.scale
+        attn = attn.softmax(dim=-1)
+
+        out = torch.matmul(attn, v).permute(0, 2, 1, 3).reshape(B, self.num_tokens, H * D)
+        return self.norm_out(self.out_proj(out))
+
+
 class ImageAdapter(nn.Module):
     """
-    MLP adapter that projects SigLIP image embedding (B, D) into
-    a sequence of tokens (B, N_img, C) for cross-attention conditioning.
+    Two outputs for SDXL conditioning:
+      - tokens:      (B, N_tokens, 2048) via cross-attention pooler + FF
+      - pooled_proj: (B, 1280) via mean-pool + MLP
     """
 
     def __init__(
         self,
-        siglip_dim: int = 1024,
-        cross_attn_dim: int = 1024,
-        num_tokens: int = 8,
-        num_layers: int = 3,
-        hidden_dim: int = 2048,
+        qwen_dim: int = 1152,
+        cross_attn_dim: int = 2048,    # SDXL encoder_hidden_states dim
+        pooled_proj_dim: int = 1280,   # SDXL text_embeds dim
+        num_tokens: int = 16,
+        num_heads: int = 8,
+        ff_mult: int = 2,
     ):
         super().__init__()
-        self.num_tokens = num_tokens
-        self.cross_attn_dim = cross_attn_dim
+        # Sequence conditioning path
+        self.pooler = CrossAttentionPooler(qwen_dim, cross_attn_dim, num_tokens, num_heads)
+        self.ff_norm = nn.LayerNorm(cross_attn_dim)
+        self.ff = nn.Sequential(
+            nn.Linear(cross_attn_dim, cross_attn_dim * ff_mult),
+            nn.GELU(),
+            nn.Linear(cross_attn_dim * ff_mult, cross_attn_dim),
+        )
 
-        layers = []
-        in_dim = siglip_dim
-        for i in range(num_layers - 1):
-            layers.extend([
-                nn.Linear(in_dim, hidden_dim),
-                nn.LayerNorm(hidden_dim),
-                nn.GELU(),
-            ])
-            in_dim = hidden_dim
+        # Pooled projection path
+        self.pooled_proj = nn.Sequential(
+            nn.LayerNorm(qwen_dim),
+            nn.Linear(qwen_dim, pooled_proj_dim),
+            nn.SiLU(),
+            nn.Linear(pooled_proj_dim, pooled_proj_dim),
+        )
 
-        layers.append(nn.Linear(in_dim, num_tokens * cross_attn_dim))
-        layers.append(nn.LayerNorm(num_tokens * cross_attn_dim))
-
-        self.mlp = nn.Sequential(*layers)
-
-    def forward(self, z_img: torch.Tensor) -> torch.Tensor:
+    def forward(self, patch_embeds: torch.Tensor) -> tuple:
         """
         Args:
-            z_img: (B, D) SigLIP image embedding
+            patch_embeds: (B, N_patches, qwen_dim)
 
         Returns:
-            tokens_img: (B, N_img, C)
+            tokens:      (B, N_tokens, 2048)
+            pooled_proj: (B, 1280)
         """
-        out = self.mlp(z_img)  # (B, N_img * C)
-        tokens_img = out.view(-1, self.num_tokens, self.cross_attn_dim)
-        return tokens_img
+        tokens = self.pooler(patch_embeds)                      # (B, N_tokens, 2048)
+        tokens = tokens + self.ff(self.ff_norm(tokens))         # residual FF
 
-
-class TextAdapter(nn.Module):
-    """Linear projection of T5 text embeddings to cross-attention dimension."""
-
-    def __init__(self, t5_dim: int = 4096, cross_attn_dim: int = 1024):
-        super().__init__()
-        self.proj = nn.Linear(t5_dim, cross_attn_dim)
-        self.norm = nn.LayerNorm(cross_attn_dim)
-
-    def forward(self, z_txt: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            z_txt: (B, T, C_t5) T5 text embeddings
-
-        Returns:
-            tokens_txt: (B, T, C)
-        """
-        return self.norm(self.proj(z_txt))
+        pooled = self.pooled_proj(patch_embeds.mean(dim=1))     # (B, 1280)
+        return tokens, pooled

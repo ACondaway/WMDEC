@@ -1,14 +1,11 @@
 model:
-  siglip_model: "google/siglip-large-patch16-384"
-  siglip_dim: 1024
-  t5_dim: 4096
-  cross_attn_dim: 1024
-  num_img_tokens: 8
-  adapter_layers: 3
-  model_channels: 320
-  channel_mult: [1, 2, 4, 4]
+  unet_name: "stabilityai/stable-diffusion-xl-base-1.0"
+  qwen_encoder_ckpt: "/share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt"
+  qwen_dim: 1152
+  cross_attn_dim: 2048
+  pooled_proj_dim: 1280
+  num_img_tokens: 16
   num_heads: 8
-  vae_name: "stabilityai/sd-vae-ft-mse"
 
 diffusion:
   num_timesteps: 1000
@@ -17,26 +14,39 @@ diffusion:
   schedule: "scaled_linear"
 
 training:
-  batch_size_per_gpu: 16
-  max_steps: 200000
-  lr: 1.0e-4
+  batch_size_per_gpu: 2
+  max_steps: 300000
+  lr: 5.0e-5
   weight_decay: 0.01
   grad_clip: 1.0
+  gradient_checkpointing: true
+  cfg_drop_prob: 0.10
   lambda_sem: 0.1
   sem_loss_every: 10
   log_every: 100
-  ploy_every: 100
+  plot_every: 100
   save_every: 10000
   visualize_every: 1000
-  output_dir: "/share/project/congsheng/WMDEC/v1_checkpoints"
+  output_dir: "/share/project/congsheng/WMDEC/v3_sdxl_checkpoints"
 
 data:
-  embedding_dir: "/share/project/congsheng/robobrain-dex-siglip-embedding"
-  image_dir: "/share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex"
-  resolution: 256
+  resolution: 1024
   num_workers: 4
+  # Rebalancing: alpha=1.0 → proportional, alpha=0.0 → equal per dataset, 0.7 recommended
+  rebalance_alpha: 0.7
+  # num_samples_per_epoch: null means use total dataset size
+  num_samples_per_epoch: null
+
+  datasets:
+    - name: "robobrain-dex"
+      embedding_dir: "/share/project/congsheng/robobrain-dex-qwen-embedding"
+      image_dir: "/share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex"
+    # Add more datasets below. Each needs a registered preprocessor in
+    # data/preprocessors/__init__.py
+    # - name: "my_new_dataset"
+    #   embedding_dir: "/share/project/congsheng/my-new-dataset-qwen-embedding"
+    #   image_dir: "/share/.../my_new_dataset"
 
 inference:
   num_steps: 50
-  cfg_scale_img: 2.0
-  cfg_scale_txt: 1.0
+  cfg_scale: 2.0

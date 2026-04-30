@@ -1,30 +1,58 @@
 """
-Multi-GPU offline preprocessing script to extract SigLIP and T5-XXL embeddings
-from the robobrain-dex dataset and store them as .pt files.
+Multi-GPU offline preprocessing orchestrator.
 
-Each GPU gets an equal shard of the dataset. Uses torchrun for launching.
+Uses the abstract BaseDatasetPreprocessor API so any registered dataset can be
+processed with the same script. After processing, per-dataset and combined
+statistics are printed and saved.
 
-Usage:
-    torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
-        --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
-        --output_dir /share/project/congsheng/robobrain-dex-siglip-embedding \
-        --batch_size 64
+Usage — single dataset:
+    torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \\
+        --dataset robobrain-dex \\
+        --image_dir /share/project/hotel/.../robobrain-dex \\
+        --output_dir /share/project/congsheng/robobrain-dex-qwen-embedding \\
+        --encoder_ckpt /share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt \\
+        --batch_size 16
+
+Usage — multiple datasets in one launch (sequential, each on all GPUs):
+    torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \\
+        --config scripts/preprocess_config.yaml \\
+        --encoder_ckpt /share/project/congsheng/checkpoints/qwen_visual_encoder_3b.pt
+
+preprocess_config.yaml format:
+    output_root: /share/project/congsheng/all-embeddings
+    datasets:
+      - name: robobrain-dex
+        image_dir: /share/project/hotel/.../robobrain-dex
+      - name: my_new_dataset          # must be registered in PREPROCESSORS
+        image_dir: /share/.../my_new_dataset
+
+To register a new dataset, subclass BaseDatasetPreprocessor and add to PREPROCESSORS
+in data/preprocessors/__init__.py.
 """
 
 import os
 import sys
 import argparse
-import glob
+import time
+import yaml
+from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import torch
 import torch.distributed as dist
-from PIL import Image
 from tqdm import tqdm
 
-from models.siglip_encoder import SigLIPEncoder
-from models.text_encoder import T5TextEncoder
+from models.qwen_visual_encoder import QwenVisualEncoder
+from data.preprocessors import PREPROCESSORS, BaseDatasetPreprocessor, SampleMeta
+from data.stats import (
+    DatasetStats,
+    compute_output_size,
+    print_dataset_stats,
+    print_combined_stats,
+    save_stats,
+    save_combined_stats,
+)
 
 
 def setup_distributed():
@@ -36,132 +64,177 @@ def setup_distributed():
     return rank, world_size, local_rank
 
 
-def find_all_images(image_dir: str) -> list[dict]:
-    """
-    Find all images and extract task names.
-
-    Structure:
-        image_dir/{Task_name}/videos/chunk-000/observation.images.image_top/episode_XXXXXX/image_X.0.jpg
-    """
-    pattern = os.path.join(
-        image_dir, "*", "videos", "chunk-000",
-        "observation.images.image_top", "episode_*", "*.jpg"
-    )
-    image_paths = sorted(glob.glob(pattern))
-
-    samples = []
-    for path in image_paths:
-        rel = os.path.relpath(path, image_dir)
-        parts = rel.split(os.sep)
-        task_name = parts[0]
-        episode = parts[-2]  # episode_XXXXXX
-        filename = os.path.splitext(parts[-1])[0]  # image_X.0
-
-        samples.append({
-            "image_path": path,
-            "task_name": task_name,
-            "episode": episode,
-            "filename": filename,
-            "text": task_name.replace("_", " "),
-        })
-
-    return samples
-
-
-def shard_samples(samples: list[dict], rank: int, world_size: int) -> list[dict]:
-    """Split samples evenly across ranks."""
+def shard(samples, rank, world_size):
     return samples[rank::world_size]
 
 
-def process_batch(
-    batch_samples: list[dict],
-    siglip: SigLIPEncoder,
-    text_encoder: T5TextEncoder,
-    output_dir: str,
-):
-    """Process a batch of images and save embeddings."""
-    images = []
-    for s in batch_samples:
-        img = Image.open(s["image_path"]).convert("RGB")
-        images.append(img)
+def process_dataset(
+    preprocessor: BaseDatasetPreprocessor,
+    encoder: QwenVisualEncoder,
+    device: torch.device,
+    batch_size: int,
+    rank: int,
+    world_size: int,
+    is_main: bool,
+) -> DatasetStats:
+    """Run preprocessing for one dataset across all ranks. Returns stats (rank 0 only)."""
 
-    texts = [s["text"] for s in batch_samples]
+    if is_main:
+        print(f"\n[{preprocessor.dataset_name}] Finding samples ...")
+    dist.barrier()
 
-    # Encode
-    z_img = siglip.encode_image_from_raw(images)  # (B, D)
-    z_txt = text_encoder.encode(texts)             # (B, T, C)
+    all_samples = preprocessor.find_samples()
 
-    # Save individually
-    for i, s in enumerate(batch_samples):
-        out_dir = os.path.join(output_dir, s["task_name"], s["episode"])
-        os.makedirs(out_dir, exist_ok=True)
-        out_path = os.path.join(out_dir, f"{s['filename']}.pt")
+    if is_main:
+        print(f"[{preprocessor.dataset_name}] Found {len(all_samples):,} samples")
 
-        torch.save({
-            "z_img": z_img[i].cpu(),
-            "z_txt": z_txt[i].cpu(),
-            "task_name": s["task_name"],
-            "text": s["text"],
-        }, out_path)
+    my_samples = shard(all_samples, rank, world_size)
+
+    # Count how many already exist (for skip stats)
+    already_done = sum(1 for s in my_samples if preprocessor.is_processed(s))
+
+    t0 = time.time()
+    written_local = 0
+    key_counts_local: dict[str, int] = {}
+
+    pbar = tqdm(
+        range(0, len(my_samples), batch_size),
+        desc=f"[GPU {rank}] {preprocessor.dataset_name}",
+        disable=(rank != 0),
+        dynamic_ncols=True,
+    )
+
+    for i in pbar:
+        batch = my_samples[i : i + batch_size]
+        n_written = preprocessor.process_batch(batch, encoder, device)
+        written_local += n_written
+
+        # Accumulate group counts (all samples, not just written)
+        for s in batch:
+            key = preprocessor.stats_key(s)
+            key_counts_local[key] = key_counts_local.get(key, 0) + 1
+
+    dist.barrier()
+    elapsed = time.time() - t0
+
+    # Aggregate stats on rank 0 via all_reduce / gather
+    stats = DatasetStats(dataset_name=preprocessor.dataset_name)
+
+    if dist.is_available() and dist.is_initialized():
+        # Reduce scalar counts
+        def reduce_int(val: int) -> int:
+            t = torch.tensor(val, dtype=torch.long, device=device)
+            dist.all_reduce(t, op=dist.ReduceOp.SUM)
+            return t.item()
+
+        total_samples = reduce_int(len(my_samples))
+        total_written = reduce_int(written_local)
+        total_skipped = reduce_int(already_done)
+
+        if is_main:
+            stats.total_frames = total_samples
+            stats.written_frames_override = total_written  # not a real field, just for display
+            stats.skipped_frames = total_skipped
+    else:
+        stats.total_frames = len(my_samples)
+        stats.skipped_frames = already_done
+
+    # Gather per-group counts to rank 0
+    all_key_counts = [None] * world_size
+    dist.all_gather_object(all_key_counts, key_counts_local)
+
+    if is_main:
+        merged: dict[str, int] = {}
+        for kc in all_key_counts:
+            for k, v in kc.items():
+                merged[k] = merged.get(k, 0) + v
+        stats.frames_per_group = merged
+        stats.processing_time_seconds = elapsed
+        stats.output_size_bytes = compute_output_size(
+            preprocessor.output_root, preprocessor.dataset_name
+        )
+
+    return stats
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--image_dir", type=str, required=True,
-                        help="Root image directory (robobrain-dex)")
-    parser.add_argument("--output_dir", type=str, required=True,
-                        help="Output directory for embeddings")
-    parser.add_argument("--siglip_model", type=str,
-                        default="google/siglip-large-patch16-384")
-    parser.add_argument("--t5_model", type=str,
-                        default="google/t5-xxl-lm-adapt")
-    parser.add_argument("--batch_size", type=int, default=32)
+    parser = argparse.ArgumentParser(description="Offline Qwen visual embedding extraction")
+    parser.add_argument("--encoder_ckpt", type=str, required=True,
+                        help="Path to standalone Qwen visual encoder .pt")
+    parser.add_argument("--batch_size", type=int, default=16)
+
+    # Single-dataset mode
+    parser.add_argument("--dataset", type=str, default=None,
+                        help=f"Dataset name. Available: {list(PREPROCESSORS.keys())}")
+    parser.add_argument("--image_dir", type=str, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
+
+    # Multi-dataset mode
+    parser.add_argument("--config", type=str, default=None,
+                        help="YAML config for multi-dataset preprocessing")
+
     args = parser.parse_args()
 
     rank, world_size, local_rank = setup_distributed()
     device = torch.device(f"cuda:{local_rank}")
+    is_main = rank == 0
 
-    if rank == 0:
-        print(f"Running on {world_size} GPUs")
+    # Build job list
+    if args.config:
+        with open(args.config) as f:
+            cfg = yaml.safe_load(f)
+        output_root = Path(cfg["output_root"])
+        jobs = [
+            (d["name"], d["image_dir"], output_root)
+            for d in cfg["datasets"]
+        ]
+    elif args.dataset and args.image_dir and args.output_dir:
+        jobs = [(args.dataset, args.image_dir, Path(args.output_dir))]
+    else:
+        parser.error("Provide either --config or (--dataset + --image_dir + --output_dir)")
 
-    # Each GPU loads its own copy of the encoders
-    if rank == 0:
-        print("Loading SigLIP...")
-    siglip = SigLIPEncoder(args.siglip_model).to(device)
+    # Validate dataset names
+    for name, _, _ in jobs:
+        if name not in PREPROCESSORS:
+            raise ValueError(
+                f"Unknown dataset '{name}'. "
+                f"Available: {list(PREPROCESSORS.keys())}. "
+                f"Register new datasets in data/preprocessors/__init__.py."
+            )
 
-    if rank == 0:
-        print("Loading T5-XXL...")
-    text_encoder = T5TextEncoder(args.t5_model).to(device)
+    if is_main:
+        print(f"Running on {world_size} GPU(s)")
+        print(f"Loading Qwen visual encoder from {args.encoder_ckpt} ...")
 
-    # Find and shard data
-    if rank == 0:
-        print("Finding images...")
-    samples = find_all_images(args.image_dir)
-    if rank == 0:
-        print(f"Found {len(samples)} total images")
+    encoder = QwenVisualEncoder.from_standalone(args.encoder_ckpt).to(device)
+    encoder.eval()
 
-    my_samples = shard_samples(samples, rank, world_size)
-    if rank == 0:
-        print(f"~{len(my_samples)} images per GPU")
+    all_stats = []
+    output_root_for_combined = jobs[0][2].parent if len(jobs) > 1 else jobs[0][2].parent
 
-    # Synchronize before starting
+    for dataset_name, image_dir, output_root in jobs:
+        preprocessor_cls = PREPROCESSORS[dataset_name]
+        preprocessor = preprocessor_cls(image_dir, str(output_root))
+
+        stats = process_dataset(
+            preprocessor, encoder, device,
+            args.batch_size, rank, world_size, is_main,
+        )
+
+        if is_main:
+            print_dataset_stats(stats)
+            save_stats(stats, output_root)
+            all_stats.append(stats)
+
+    if is_main and len(all_stats) > 0:
+        if len(all_stats) > 1:
+            print_combined_stats(all_stats)
+        # Save combined stats one level above the dataset dirs
+        combined_root = jobs[0][2] if len(jobs) == 1 else jobs[0][2].parent
+        save_combined_stats(all_stats, combined_root)
+        print(f"\nStats saved to {combined_root}/combined_stats.json")
+
     dist.barrier()
-
-    # Process in batches
-    pbar = tqdm(
-        range(0, len(my_samples), args.batch_size),
-        desc=f"GPU {rank}",
-        disable=(rank != 0),
-    )
-    for i in pbar:
-        batch = my_samples[i:i + args.batch_size]
-        process_batch(batch, siglip, text_encoder, args.output_dir)
-
-    # Wait for all ranks to finish
-    dist.barrier()
-    if rank == 0:
-        print(f"Done! Embeddings saved to {args.output_dir}")
-
     dist.destroy_process_group()
 
 
