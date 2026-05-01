@@ -38,6 +38,15 @@ training:
   save_every: 10000
   visualize_every: 1000
   save_loss_history: false   # true = persist loss_history in checkpoints for seamless resume curves
+
+  # torch.compile() settings (train_compile.py only)
+  # compile_mode options: "default" | "reduce-overhead" | "max-autotune"
+  #   default         — good general-purpose choice; moderate compile time
+  #   reduce-overhead — best for small/fixed batch sizes; lowers kernel launch cost
+  #   max-autotune    — longest compile, highest runtime throughput (recommended for long runs)
+  compile_mode: "default"
+  compile_adapter: true      # also compile the ImageAdapter
+
   output_dir: "/share/project/congsheng/WMDEC/v4_sd21_checkpoints"
 
 data:
