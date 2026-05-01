@@ -1,6 +1,6 @@
 from .base import BaseDatasetPreprocessor, SampleMeta
 from .robobrain_dex import RoboBrainDexPreprocessor
-from .lerobot import LeRobotPreprocessor
+from .lerobot import LeRobotPreprocessor, LeRobotWithoutTextPreprocessor
 
 # ---------------------------------------------------------------------------
 # Schema registry
@@ -23,4 +23,8 @@ PREPROCESSORS: dict[str, type[BaseDatasetPreprocessor]] = {
 
     # type="lerobot" → name comes from the YAML `name` field at runtime
     "lerobot": LeRobotPreprocessor,
+
+    # type="lerobot_without_text" → same layout as lerobot but skips episodes.jsonl;
+    # task_name is always "" so no text encoder pass is triggered.
+    "lerobot_without_text": LeRobotWithoutTextPreprocessor,
 }

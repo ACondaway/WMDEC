@@ -131,3 +131,52 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
 
     def stats_key(self, sample: SampleMeta) -> str:
         return sample.extra_meta.get("task_name") or self.dataset_name
+
+
+class LeRobotWithoutTextPreprocessor(LeRobotPreprocessor):
+    """
+    LeRobot-format dataset where no text extraction is needed.
+
+    Identical to LeRobotPreprocessor except:
+    - meta/episodes.jsonl is NOT read (may be absent).
+    - task_name is always set to "" so no text encoder pass is triggered.
+
+    Use type="lerobot_without_text" in preprocess_config.yaml.
+    """
+
+    def find_samples(self) -> List[SampleMeta]:
+        pattern = str(
+            self.image_root
+            / "videos"
+            / "chunk-*"
+            / f"observation.images.{self._camera_key}"
+            / "episode_*"
+            / "*.jpg"
+        )
+        image_paths = sorted(glob.glob(pattern))
+
+        samples = []
+        for path in image_paths:
+            abs_path = Path(path)
+            episode_dir = abs_path.parent.name
+            filename    = abs_path.stem
+
+            try:
+                episode_index = int(episode_dir.split("_")[-1])
+            except ValueError:
+                continue
+
+            flat_rel = Path(episode_dir) / filename
+
+            samples.append(SampleMeta(
+                rel_path=flat_rel,
+                extra_meta={
+                    "task_name":        "",
+                    "episode":          episode_dir,
+                    "episode_index":    episode_index,
+                    "filename":         filename,
+                    "_abs_image_path":  str(abs_path),
+                },
+            ))
+
+        return samples
