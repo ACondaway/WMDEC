@@ -278,6 +278,10 @@ def train(config: dict, resume_path: str = None):
             images    = batch["image"].to(device)
             B = images.shape[0]
 
+            emb_noise_std = config["training"].get("embedding_noise_std", 0.0)
+            if emb_noise_std > 0.0:
+                z_img_emb = z_img_emb + torch.randn_like(z_img_emb) * emb_noise_std
+
             with torch.no_grad():
                 latent = vae.encode(images)
 

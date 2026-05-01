@@ -31,6 +31,7 @@ training:
   grad_clip: 1.0
   gradient_checkpointing: true
   cfg_drop_prob: 0.10
+  embedding_noise_std: 0.0   # std of Gaussian noise added to z_img_emb; 0 = disabled. ~0.01-0.05 recommended
   lambda_sem: 0.1
   sem_loss_every: 10
   log_every: 100
