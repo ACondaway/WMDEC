@@ -23,11 +23,21 @@ preprocess_config.yaml format:
     datasets:
       - name: robobrain-dex
         image_dir: /share/project/hotel/.../robobrain-dex
-      - name: my_new_dataset          # must be registered in PREPROCESSORS
-        image_dir: /share/.../my_new_dataset
+      - name: lerobot-dataset-a       # must match key in PREPROCESSORS
+        image_dir: /share/.../dataset-a
+      - name: lerobot-dataset-b
+        image_dir: /share/.../dataset-b
 
-To register a new dataset, subclass BaseDatasetPreprocessor and add to PREPROCESSORS
-in data/preprocessors/__init__.py.
+Supported dataset schemas
+-------------------------
+robobrain-dex (RoboBrainDexPreprocessor):
+    {image_root}/{task_name}/videos/chunk-000/observation.images.image_top/episode_*/image_*.jpg
+    Text: task_name folder name (no meta file needed).
+
+lerobot-* (LeRobotPreprocessor):
+    {image_root}/meta/episodes.jsonl   ← task instructions per episode
+    {image_root}/videos/chunk-*/observation.images.{camera_key}/episode_*/image_*.jpg
+    Register new instances in data/preprocessors/__init__.py via functools.partial.
 """
 
 import os
