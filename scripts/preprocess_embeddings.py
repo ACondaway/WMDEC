@@ -21,23 +21,27 @@ Usage — multiple datasets in one launch (sequential, each on all GPUs):
 preprocess_config.yaml format:
     output_root: /share/project/congsheng/all-embeddings
     datasets:
-      - name: robobrain-dex
+      - name: robobrain-dex           # dataset name (used as output subdir)
         image_dir: /share/project/hotel/.../robobrain-dex
-      - name: lerobot-dataset-a       # must match key in PREPROCESSORS
+        type: robobrain-dex           # schema type (registry key); omit if same as name
+      - name: your-actual-dataset-a   # any name you choose
         image_dir: /share/.../dataset-a
-      - name: lerobot-dataset-b
+        type: lerobot                 # schema type shared by all LeRobot datasets
+        camera_key: image             # optional; default "image"
+      - name: your-actual-dataset-b
         image_dir: /share/.../dataset-b
+        type: lerobot
 
-Supported dataset schemas
--------------------------
-robobrain-dex (RoboBrainDexPreprocessor):
+Supported schema types (PREPROCESSORS registry keys)
+-----------------------------------------------------
+robobrain-dex:
     {image_root}/{task_name}/videos/chunk-000/observation.images.image_top/episode_*/image_*.jpg
-    Text: task_name folder name (no meta file needed).
+    Text: task_name folder name.  No meta file needed.
 
-lerobot-* (LeRobotPreprocessor):
-    {image_root}/meta/episodes.jsonl   ← task instructions per episode
+lerobot:
+    {image_root}/meta/episodes.jsonl   ← task per episode
     {image_root}/videos/chunk-*/observation.images.{camera_key}/episode_*/image_*.jpg
-    Register new instances in data/preprocessors/__init__.py via functools.partial.
+    Supports any dataset name; add new datasets only in the YAML, no code change.
 """
 
 import os
@@ -189,27 +193,42 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     is_main = rank == 0
 
-    # Build job list
+    # Build job list — each entry is a dict with name, image_dir, output_root,
+    # schema_type, and any extra kwargs forwarded to the preprocessor constructor.
     if args.config:
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
         output_root = Path(cfg["output_root"])
-        jobs = [
-            (d["name"], d["image_dir"], output_root)
-            for d in cfg["datasets"]
-        ]
+        jobs = []
+        for d in cfg["datasets"]:
+            schema_type = d.get("type", d["name"])  # fall back to name if type omitted
+            extra = {k: v for k, v in d.items()
+                     if k not in ("name", "image_dir", "type")}
+            jobs.append({
+                "name":        d["name"],
+                "image_dir":   d["image_dir"],
+                "output_root": output_root,
+                "type":        schema_type,
+                "extra":       extra,
+            })
     elif args.dataset and args.image_dir and args.output_dir:
-        jobs = [(args.dataset, args.image_dir, Path(args.output_dir))]
+        jobs = [{
+            "name":        args.dataset,
+            "image_dir":   args.image_dir,
+            "output_root": Path(args.output_dir),
+            "type":        args.dataset,
+            "extra":       {},
+        }]
     else:
         parser.error("Provide either --config or (--dataset + --image_dir + --output_dir)")
 
-    # Validate dataset names
-    for name, _, _ in jobs:
-        if name not in PREPROCESSORS:
+    # Validate schema types
+    for job in jobs:
+        if job["type"] not in PREPROCESSORS:
             raise ValueError(
-                f"Unknown dataset '{name}'. "
-                f"Available: {list(PREPROCESSORS.keys())}. "
-                f"Register new datasets in data/preprocessors/__init__.py."
+                f"Unknown schema type '{job['type']}' for dataset '{job['name']}'. "
+                f"Available types: {list(PREPROCESSORS.keys())}. "
+                f"Register new schemas in data/preprocessors/__init__.py."
             )
 
     if is_main:
@@ -220,11 +239,20 @@ def main():
     encoder.eval()
 
     all_stats = []
-    output_root_for_combined = jobs[0][2].parent if len(jobs) > 1 else jobs[0][2].parent
 
-    for dataset_name, image_dir, output_root in jobs:
-        preprocessor_cls = PREPROCESSORS[dataset_name]
-        preprocessor = preprocessor_cls(image_dir, str(output_root))
+    for job in jobs:
+        preprocessor_cls = PREPROCESSORS[job["type"]]
+        # Pass name and any extra YAML keys (e.g. camera_key) to the constructor.
+        # RoboBrainDexPreprocessor ignores unknown kwargs via **extra (see below).
+        try:
+            preprocessor = preprocessor_cls(
+                job["image_dir"], str(job["output_root"]),
+                name=job["name"], **job["extra"],
+            )
+        except TypeError:
+            # Schema class (e.g. RoboBrainDexPreprocessor) has a fixed name —
+            # fall back to positional-only construction.
+            preprocessor = preprocessor_cls(job["image_dir"], str(job["output_root"]))
 
         stats = process_dataset(
             preprocessor, encoder, device,
@@ -233,14 +261,13 @@ def main():
 
         if is_main:
             print_dataset_stats(stats)
-            save_stats(stats, output_root)
+            save_stats(stats, job["output_root"])
             all_stats.append(stats)
 
     if is_main and len(all_stats) > 0:
         if len(all_stats) > 1:
             print_combined_stats(all_stats)
-        # Save combined stats one level above the dataset dirs
-        combined_root = jobs[0][2] if len(jobs) == 1 else jobs[0][2].parent
+        combined_root = jobs[0]["output_root"]
         save_combined_stats(all_stats, combined_root)
         print(f"\nStats saved to {combined_root}/combined_stats.json")
 

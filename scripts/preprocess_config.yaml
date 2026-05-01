@@ -1,19 +1,24 @@
 # Multi-dataset preprocessing config for preprocess_embeddings.py
-# Embeddings are stored under: {output_root}/{dataset_name}/...
+# Embeddings are stored under: {output_root}/{name}/...
+#
+# Fields per dataset:
+#   name       — output subdirectory name (any string you choose)
+#   image_dir  — absolute path to dataset root
+#   type       — schema type (registry key in data/preprocessors/__init__.py)
+#                Omit when type == name (e.g. robobrain-dex)
+#   camera_key — (lerobot only) subdirectory under observation.images.*; default "image"
 
 output_root: /share/project/congsheng/all-qwen-embeddings
 
 datasets:
   - name: robobrain-dex
     image_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex
+    # type defaults to name → uses RoboBrainDexPreprocessor
+
   - name: ego-dex
     image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/egodex_1fps_refreshed
+    type: lerobot
+
   - name: gen-ego-data
     image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/GenEgoData
-
-  # Add more datasets here. Each `name` must be registered in
-  # data/preprocessors/__init__.py. Implement BaseDatasetPreprocessor
-  # and add to the PREPROCESSORS dict.
-  #
-  # - name: my_new_dataset
-  #   image_dir: /share/.../my_new_dataset
+    type: lerobot
