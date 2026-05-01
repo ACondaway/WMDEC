@@ -292,6 +292,7 @@ def train(config: dict, resume_path: str = None):
                 postfix = {
                     "loss": f"{losses['total'].item():.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
+                    "epoch": f"{epoch}",
                 }
                 if "semantic" in losses:
                     postfix["sem"] = f"{losses['semantic'].item():.4f}"
