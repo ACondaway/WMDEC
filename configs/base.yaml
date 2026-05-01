@@ -1,9 +1,12 @@
 model:
-  unet_name: "stabilityai/stable-diffusion-xl-base-1.0"
+  # backbone: "sdxl"  — ε-prediction, cross_attn_dim=2048, pooled_proj_dim=1280, ~2.6B params
+  # backbone: "sd21"  — v-prediction, cross_attn_dim=1024, no pooled_proj_dim,   ~865M params
+  backbone: "sd21"
+  unet_name: "stabilityai/stable-diffusion-2-1-base"
   qwen_encoder_ckpt: "/share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt"
-  qwen_dim: 2560           # out_hidden_size of Qwen3.5-VL-4B projected ViT output (ViT hidden=1024, projected=2560)
-  cross_attn_dim: 2048
-  pooled_proj_dim: 1280
+  qwen_dim: 2560           # Qwen3.5-4B visual output dim (2560)
+  cross_attn_dim: 1024     # SD 2.1-base UNet cross-attention dim (use 2048 for sdxl)
+  # pooled_proj_dim: 1280  # SDXL only — omit or comment out for sd21
   num_img_tokens: 16
   num_heads: 8
 
@@ -21,7 +24,7 @@ training:
   lora_alpha: 64
   # lora_target_modules: null  # null = default ["to_q","to_k","to_v","to_out.0","to_add_out"]
 
-  batch_size_per_gpu: 1
+  batch_size_per_gpu: 32    # 56×56 latent fits ~32-48 per H100 in full training
   max_steps: 300000
   lr: 5.0e-5
   weight_decay: 0.01
@@ -35,10 +38,10 @@ training:
   save_every: 10000
   visualize_every: 1000
   save_loss_history: false   # true = persist loss_history in checkpoints for seamless resume curves
-  output_dir: "/share/project/congsheng/WMDEC/v3_sdxl_checkpoints"
+  output_dir: "/share/project/congsheng/WMDEC/v4_sd21_checkpoints"
 
 data:
-  resolution: 1024
+  resolution: 448
   num_workers: 4
   # Rebalancing: alpha=1.0 → proportional, alpha=0.0 → equal per dataset, 0.7 recommended
   rebalance_alpha: 0.7

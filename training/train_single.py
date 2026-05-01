@@ -20,6 +20,10 @@ When to prefer DDP (train.py):
 
 device_map="auto" places the UNet layers on GPUs in order of VRAM availability.
 Activations are moved between devices transparently during the forward pass.
+
+Backbone support:
+  backbone="sdxl"  — ε-prediction; SDXLUNetSharded; UNet takes (x, t, tokens, pooled, time_ids)
+  backbone="sd21"  — v-prediction; LDMUNetSharded;  UNet takes (x, t, tokens)
 """
 
 import os
@@ -49,7 +53,7 @@ from training.cfg import apply_condition_dropout
 from data.dataset import MultiDatasetEmbeddingDataset
 
 # -------------------------------------------------------------------------
-# UNet with device_map
+# UNet with device_map — two backbones
 # -------------------------------------------------------------------------
 
 class SDXLUNetSharded(nn.Module):
@@ -57,7 +61,11 @@ class SDXLUNetSharded(nn.Module):
     SDXL UNet loaded with device_map="auto" so its layers are spread
     across all available GPUs.  The first (input) device is accessible
     via self.first_device.
+
+    forward(x, t, encoder_hidden_states, pooled_proj, time_ids) → ε_pred
     """
+
+    _SDXL_LORA_TARGETS = ["to_q", "to_k", "to_v", "to_out.0", "to_add_out"]
 
     def __init__(
         self,
@@ -66,7 +74,73 @@ class SDXLUNetSharded(nn.Module):
     ):
         super().__init__()
         n_gpus = torch.cuda.device_count()
-        print(f"Loading UNet with device_map='auto' across {n_gpus} GPU(s) ...")
+        print(f"Loading SDXL UNet with device_map='auto' across {n_gpus} GPU(s) ...")
+        self.unet = UNet2DConditionModel.from_pretrained(
+            model_name,
+            subfolder="unet",
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+        )
+        if gradient_checkpointing:
+            self.unet.enable_gradient_checkpointing()
+        self.first_device = next(iter(self.unet.hf_device_map.values()))
+        print(f"UNet device map: {self.unet.hf_device_map}")
+
+    def setup_lora(self, rank: int = 64, alpha: int = 64, target_modules: list = None) -> None:
+        from peft import LoraConfig, get_peft_model
+        for p in self.unet.parameters():
+            p.requires_grad = False
+        lora_cfg = LoraConfig(
+            r=rank, lora_alpha=alpha,
+            target_modules=target_modules or self._SDXL_LORA_TARGETS,
+            lora_dropout=0.0, bias="none",
+        )
+        self.unet = get_peft_model(self.unet, lora_cfg)
+        trainable, total = self.unet.get_nb_trainable_parameters()
+        print(f"LoRA: {trainable/1e6:.1f}M trainable / {total/1e6:.1f}M total UNet params")
+
+    def save_lora(self, output_dir: str) -> None:
+        self.unet.save_pretrained(output_dir)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        pooled_proj: torch.Tensor,
+        time_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        d = self.first_device
+        out = self.unet(
+            x.to(d), t.to(d),
+            encoder_hidden_states=encoder_hidden_states.to(d),
+            added_cond_kwargs={
+                "text_embeds": pooled_proj.to(d),
+                "time_ids": time_ids.to(d),
+            },
+        )
+        return out.sample
+
+
+class LDMUNetSharded(nn.Module):
+    """
+    SD 2.1-base UNet loaded with device_map="auto" so its layers are spread
+    across all available GPUs.  The first (input) device is accessible
+    via self.first_device.
+
+    forward(x, t, encoder_hidden_states) → v_pred
+    """
+
+    _SD21_LORA_TARGETS = ["to_q", "to_k", "to_v", "to_out.0"]
+
+    def __init__(
+        self,
+        model_name: str = "stabilityai/stable-diffusion-2-1-base",
+        gradient_checkpointing: bool = True,
+    ):
+        super().__init__()
+        n_gpus = torch.cuda.device_count()
+        print(f"Loading SD 2.1 UNet with device_map='auto' across {n_gpus} GPU(s) ...")
         self.unet = UNet2DConditionModel.from_pretrained(
             model_name,
             subfolder="unet",
@@ -82,12 +156,11 @@ class SDXLUNetSharded(nn.Module):
 
     def setup_lora(self, rank: int = 64, alpha: int = 64, target_modules: list = None) -> None:
         from peft import LoraConfig, get_peft_model
-        _DEFAULT = ["to_q", "to_k", "to_v", "to_out.0", "to_add_out"]
         for p in self.unet.parameters():
             p.requires_grad = False
         lora_cfg = LoraConfig(
             r=rank, lora_alpha=alpha,
-            target_modules=target_modules or _DEFAULT,
+            target_modules=target_modules or self._SD21_LORA_TARGETS,
             lora_dropout=0.0, bias="none",
         )
         self.unet = get_peft_model(self.unet, lora_cfg)
@@ -97,17 +170,22 @@ class SDXLUNetSharded(nn.Module):
     def save_lora(self, output_dir: str) -> None:
         self.unet.save_pretrained(output_dir)
 
-    def forward(self, x, t, encoder_hidden_states, pooled_proj, time_ids):
+    def forward(self, x: torch.Tensor, t: torch.Tensor, encoder_hidden_states: torch.Tensor) -> torch.Tensor:
         d = self.first_device
         out = self.unet(
             x.to(d), t.to(d),
             encoder_hidden_states=encoder_hidden_states.to(d),
-            added_cond_kwargs={
-                "text_embeds": pooled_proj.to(d),
-                "time_ids":    time_ids.to(d),
-            },
         )
         return out.sample
+
+
+def build_unet_sharded(config: dict, gradient_checkpointing: bool = True):
+    """Factory: returns SDXLUNetSharded or LDMUNetSharded based on config backbone."""
+    backbone = config["model"].get("backbone", "sdxl")
+    model_name = config["model"]["unet_name"]
+    if backbone == "sd21":
+        return LDMUNetSharded(model_name, gradient_checkpointing)
+    return SDXLUNetSharded(model_name, gradient_checkpointing)
 
 
 # -------------------------------------------------------------------------
@@ -119,7 +197,8 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def make_time_ids(batch_size: int, resolution: int, device) -> torch.Tensor:
+def make_time_ids(batch_size: int, resolution: int, device: torch.device) -> torch.Tensor:
+    """SDXL added conditioning: [orig_h, orig_w, crop_y, crop_x, target_h, target_w]."""
     ids = torch.tensor(
         [resolution, resolution, 0, 0, resolution, resolution],
         dtype=torch.float32, device=device,
@@ -171,17 +250,20 @@ def train(config: dict, resume_path: str = None):
     # All non-UNet models live on GPU 0 (or CPU if no GPU available).
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
+    backbone = config["model"].get("backbone", "sdxl")
+
     # ---- Models ----
     img_adapter = ImageAdapter(
         qwen_dim=config["model"]["qwen_dim"],
         cross_attn_dim=config["model"]["cross_attn_dim"],
-        pooled_proj_dim=config["model"]["pooled_proj_dim"],
+        pooled_proj_dim=config["model"].get("pooled_proj_dim", 1280),
         num_tokens=config["model"]["num_img_tokens"],
         num_heads=config["model"]["num_heads"],
+        backbone=backbone,
     ).to(device)
 
-    unet = SDXLUNetSharded(
-        model_name=config["model"]["unet_name"],
+    unet = build_unet_sharded(
+        config,
         gradient_checkpointing=config["training"].get("gradient_checkpointing", True),
     )
 
@@ -279,7 +361,7 @@ def train(config: dict, resume_path: str = None):
 
     print(f"Training from step {global_step} / {max_steps}")
     print(f"Trainable params: {sum(p.numel() for p in params if p.requires_grad) / 1e6:.1f}M")
-    print(f"GPUs: {torch.cuda.device_count()}  |  mode: {training_mode}")
+    print(f"GPUs: {torch.cuda.device_count()}  |  backbone: {backbone}  |  mode: {training_mode}")
     pbar = tqdm(total=max_steps, initial=global_step, desc="Training", dynamic_ncols=True, miniters=100)
 
     while global_step < max_steps:
@@ -299,23 +381,33 @@ def train(config: dict, resume_path: str = None):
                 tokens, pooled, p_drop=config["training"]["cfg_drop_prob"]
             )
 
-            time_ids = make_time_ids(B, resolution, device)
             noise = torch.randn_like(latent)
             t = scheduler.sample_timesteps(B, device)
             x_t = scheduler.q_sample(latent, t, noise)
 
-            # UNet forward — inputs are moved to unet_device inside SDXLUNetSharded
-            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
-                eps_pred = unet(x_t, t, tokens, pooled, time_ids)
-                eps_pred = eps_pred.to(device)  # bring back to GPU 0 for loss
-                losses = criterion(eps_pred, noise)
+            # Backbone-dependent target and UNet forward.
+            if backbone == "sd21":
+                target = scheduler.get_v_target(latent, noise, t)
+            else:
+                target = noise
 
-            # Semantic loss
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                if backbone == "sd21":
+                    pred = unet(x_t, t, tokens)
+                else:
+                    time_ids = make_time_ids(B, resolution, device)
+                    pred = unet(x_t, t, tokens, pooled, time_ids)
+                pred = pred.to(device)  # bring back to GPU 0 for loss
+                losses = criterion(pred, target)
+
+            # Semantic loss — backbone-aware x_0 recovery.
             sem_every = config["training"].get("sem_loss_every", 10)
             if qwen_enc is not None and global_step % sem_every == 0:
                 with torch.no_grad():
-                    alpha_t = scheduler.alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
-                    x0_pred = (x_t - (1 - alpha_t).sqrt() * eps_pred) / alpha_t.sqrt()
+                    if backbone == "sd21":
+                        x0_pred = scheduler.predict_x0_from_v(pred.detach(), x_t, t)
+                    else:
+                        x0_pred = scheduler.predict_x0_from_eps(pred.detach(), x_t, t)
                     img_pred = vae.decode(x0_pred.clamp(-1, 1))
                     from torchvision.transforms.functional import to_pil_image
                     img_pred_448 = F.interpolate(img_pred, size=(448, 448), mode="bilinear", align_corners=False)
@@ -362,23 +454,26 @@ def train(config: dict, resume_path: str = None):
                     gt = (images[:vis_n] * 0.5 + 0.5).clamp(0, 1).cpu()
 
                     vis_tokens, vis_pooled = img_adapter(z_img_emb[:vis_n])
-                    vis_time_ids = make_time_ids(vis_n, resolution, device)
 
                     # Full DDIM from pure noise — matches inference exactly.
                     from diffusers import DDIMScheduler as _DDIMSched
-                    _ddim = _DDIMSched(
-                        num_train_timesteps=1000, beta_start=0.00085, beta_end=0.012,
-                        beta_schedule="scaled_linear", clip_sample=False, set_alpha_to_one=False,
+                    _ddim = _DDIMSched.from_pretrained(
+                        config["model"]["unet_name"], subfolder="scheduler"
                     )
                     _ddim.set_timesteps(10)
                     x = torch.randn(vis_n, 4, resolution // 8, resolution // 8, device=device)
                     for _t in _ddim.timesteps:
                         _t_b = torch.full((vis_n,), _t, device=device, dtype=torch.long)
-                        _eps = unet(x, _t_b, vis_tokens, vis_pooled, vis_time_ids).to(device)
-                        x = _ddim.step(_eps, _t, x).prev_sample
-                    pred = (vae.decode(x) * 0.5 + 0.5).clamp(0, 1).cpu()
+                        if backbone == "sd21":
+                            _out = unet(x, _t_b, vis_tokens)
+                        else:
+                            _vis_time_ids = make_time_ids(vis_n, resolution, device)
+                            _out = unet(x, _t_b, vis_tokens, vis_pooled, _vis_time_ids)
+                        _out = _out.to(device)
+                        x = _ddim.step(_out, _t, x).prev_sample
+                    pred_vis = (vae.decode(x) * 0.5 + 0.5).clamp(0, 1).cpu()
 
-                    grid = make_grid(torch.cat([gt, pred], dim=0), nrow=vis_n)
+                    grid = make_grid(torch.cat([gt, pred_vis], dim=0), nrow=vis_n)
                     save_image(grid, os.path.join(vis_dir, f"step_{global_step}.png"))
                 img_adapter.train()
                 unet.train()

@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from models.adapter import ImageAdapter
-from models.unet import SDXLUNet
+from models.unet import build_unet
 from models.vae import VAEWrapper
 from models.qwen_visual_encoder import QwenVisualEncoder
 from diffusion.scheduler import DDPMScheduler
@@ -44,6 +44,7 @@ def cleanup():
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
+
 
 
 def make_time_ids(batch_size: int, resolution: int, device: torch.device) -> torch.Tensor:
@@ -98,16 +99,19 @@ def train(config: dict, resume_path: str = None):
     is_main = local_rank == 0
 
     # ---- Models ----
+    backbone = config["model"].get("backbone", "sdxl")
+
     img_adapter = ImageAdapter(
         qwen_dim=config["model"]["qwen_dim"],
         cross_attn_dim=config["model"]["cross_attn_dim"],
-        pooled_proj_dim=config["model"]["pooled_proj_dim"],
+        pooled_proj_dim=config["model"].get("pooled_proj_dim", 1280),
         num_tokens=config["model"]["num_img_tokens"],
         num_heads=config["model"]["num_heads"],
+        backbone=backbone,
     ).to(device)
 
-    unet = SDXLUNet(
-        model_name=config["model"]["unet_name"],
+    unet = build_unet(
+        config,
         gradient_checkpointing=config["training"].get("gradient_checkpointing", True),
     ).to(device)
 
@@ -249,20 +253,30 @@ def train(config: dict, resume_path: str = None):
                 tokens, pooled, p_drop=config["training"]["cfg_drop_prob"]
             )
 
-            time_ids = make_time_ids(B, resolution, device)
             noise = torch.randn_like(latent)
             t = scheduler.sample_timesteps(B, device)
             x_t = scheduler.q_sample(latent, t, noise)
 
+            if backbone == "sd21":
+                target = scheduler.get_v_target(latent, noise, t)
+            else:
+                target = noise
+
             with autocast():
-                eps_pred = unet(x_t, t, tokens, pooled, time_ids)
-                losses = criterion(eps_pred, noise)
+                if backbone == "sd21":
+                    pred = unet(x_t, t, tokens)
+                else:
+                    time_ids = make_time_ids(B, resolution, device)
+                    pred = unet(x_t, t, tokens, pooled, time_ids)
+                losses = criterion(pred, target)
 
             sem_every = config["training"].get("sem_loss_every", 10)
             if qwen_enc is not None and global_step % sem_every == 0:
                 with torch.no_grad():
-                    alpha_t = scheduler.alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
-                    x_0_pred = (x_t - torch.sqrt(1 - alpha_t) * eps_pred) / torch.sqrt(alpha_t)
+                    if backbone == "sd21":
+                        x_0_pred = scheduler.predict_x0_from_v(pred.detach(), x_t, t)
+                    else:
+                        x_0_pred = scheduler.predict_x0_from_eps(pred.detach(), x_t, t)
                     x_0_pred = torch.clamp(x_0_pred, -1, 1)
                     img_pred = vae.decode(x_0_pred)
                     img_pred_448 = torch.nn.functional.interpolate(
@@ -320,24 +334,22 @@ def train(config: dict, resume_path: str = None):
                         gt = (images[:vis_n] * 0.5 + 0.5).clamp(0, 1).cpu()
 
                         vis_tokens, vis_pooled = _adapter(z_img_emb[:vis_n])
-                        vis_time_ids = make_time_ids(vis_n, resolution, device)
 
                         # Full DDIM from pure noise — matches inference exactly.
                         from diffusers import DDIMScheduler as _DDIMSched
-                        _ddim = _DDIMSched(
-                            num_train_timesteps=1000,
-                            beta_start=0.00085,
-                            beta_end=0.012,
-                            beta_schedule="scaled_linear",
-                            clip_sample=False,
-                            set_alpha_to_one=False,
+                        _ddim = _DDIMSched.from_pretrained(
+                            config["model"]["unet_name"], subfolder="scheduler"
                         )
                         _ddim.set_timesteps(10)
                         x = torch.randn(vis_n, 4, resolution // 8, resolution // 8, device=device)
                         for _t in _ddim.timesteps:
                             _t_b = torch.full((vis_n,), _t, device=device, dtype=torch.long)
-                            _eps = _unet(x, _t_b, vis_tokens, vis_pooled, vis_time_ids)
-                            x = _ddim.step(_eps, _t, x).prev_sample
+                            if backbone == "sd21":
+                                _out = _unet(x, _t_b, vis_tokens)
+                            else:
+                                _vis_time_ids = make_time_ids(vis_n, resolution, device)
+                                _out = _unet(x, _t_b, vis_tokens, vis_pooled, _vis_time_ids)
+                            x = _ddim.step(_out, _t, x).prev_sample
                         pred = (vae.decode(x) * 0.5 + 0.5).clamp(0, 1).cpu()
 
                         grid = make_grid(torch.cat([gt, pred], dim=0), nrow=vis_n)
@@ -363,6 +375,8 @@ def train(config: dict, resume_path: str = None):
                         lambda_sem=config["training"]["lambda_sem"],
                         output_dir=config["training"]["output_dir"],
                         global_step=global_step,
+                        backbone=backbone,
+                        resolution=resolution,
                     )
                     loss_history["val/loss_diffusion"].append((global_step, val_metrics["val/loss_diffusion"]))
                     loss_history["val/cosine_sim"].append((global_step, val_metrics["val/cosine_sim"]))
@@ -400,6 +414,9 @@ def train(config: dict, resume_path: str = None):
                         ddim_steps=val_cfg.get("val_ddim_steps", 20),
                         cfg_scale=val_cfg.get("val_cfg_scale", 2.0),
                         max_batches=val_cfg.get("val_full_max_batches", 4),
+                        backbone=backbone,
+                        model_name=config["model"]["unet_name"],
+                        resolution=resolution,
                     )
                     if full_metrics["val/lpips"] >= 0:
                         loss_history["val/lpips"].append((global_step, full_metrics["val/lpips"]))

@@ -1,5 +1,5 @@
 """
-Validation utilities for the SigLIP/Qwen → SDXL diffusion decoder.
+Validation utilities for the SigLIP/Qwen → diffusion decoder.
 
 Two validation modes:
   fast  — diffusion loss + cosine similarity in Qwen patch space.
@@ -12,6 +12,10 @@ Two validation modes:
 
 Both modes run on rank-0 only.  Results are returned as a plain dict so the
 caller can log / compare / decide whether to save a "best" checkpoint.
+
+Backbone support:
+  backbone="sdxl"  — ε-prediction; UNet takes (x, t, tokens, pooled, time_ids)
+  backbone="sd21"  — v-prediction; UNet takes (x, t, tokens)
 """
 
 import os
@@ -27,6 +31,15 @@ try:
     _LPIPS_AVAILABLE = True
 except ImportError:
     _LPIPS_AVAILABLE = False
+
+
+def _make_time_ids(batch_size: int, resolution: int, device: torch.device) -> torch.Tensor:
+    """SDXL added conditioning: [orig_h, orig_w, crop_y, crop_x, target_h, target_w]."""
+    ids = torch.tensor(
+        [resolution, resolution, 0, 0, resolution, resolution],
+        dtype=torch.float32, device=device,
+    )
+    return ids.unsqueeze(0).expand(batch_size, -1)
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +107,8 @@ def run_fast_validation(
     output_dir: str = None,
     global_step: int = 0,
     n_vis: int = 4,
+    backbone: str = "sdxl",
+    resolution: int = 512,
 ) -> dict:
     """
     Compute diffusion loss and cosine similarity over the val set.
@@ -124,25 +139,29 @@ def run_fast_validation(
         # No condition dropout during validation.
         tokens, pooled = img_adapter(z_img_emb)
 
-        resolution = images.shape[-1]
-        ids = torch.tensor(
-            [resolution, resolution, 0, 0, resolution, resolution],
-            dtype=torch.float32, device=device,
-        ).unsqueeze(0).expand(B, -1)
-
         noise = torch.randn_like(latent)
         t = scheduler.sample_timesteps(B, device)
         x_t = scheduler.q_sample(latent, t, noise)
 
-        eps_pred = unet(x_t, t, tokens, pooled, ids)
-        diff_loss = F.mse_loss(eps_pred, noise).item()
+        # Backbone-dependent target and UNet call.
+        if backbone == "sd21":
+            target = scheduler.get_v_target(latent, noise, t)
+            pred = unet(x_t, t, tokens)
+        else:
+            target = noise
+            time_ids = _make_time_ids(B, resolution, device)
+            pred = unet(x_t, t, tokens, pooled, time_ids)
+
+        diff_loss = F.mse_loss(pred, target).item()
 
         # Single-step x_0 estimate → cosine sim in Qwen space.
         x0_pred = None
         if qwen_enc is not None:
-            alpha_t = scheduler.alphas_cumprod.to(device)[t].view(-1, 1, 1, 1)
-            x0_pred = (x_t - (1 - alpha_t).sqrt() * eps_pred) / alpha_t.sqrt()
-            x0_pred = x0_pred.clamp(-1, 1)
+            if backbone == "sd21":
+                x0_pred = scheduler.predict_x0_from_v(pred, x_t, t).clamp(-1, 1)
+            else:
+                x0_pred = scheduler.predict_x0_from_eps(pred, x_t, t).clamp(-1, 1)
+
             img_pred = vae.decode(x0_pred)
             img_pred_448 = F.interpolate(
                 img_pred, size=(448, 448), mode="bilinear", align_corners=False
@@ -204,12 +223,15 @@ def run_full_validation(
     ddim_steps: int = 20,
     cfg_scale: float = 2.0,
     max_batches: int = 4,
+    backbone: str = "sdxl",
+    model_name: str = None,
+    resolution: int = 512,
 ) -> dict:
     """
     Generate images with DDIM and compute LPIPS.
 
     Saves a side-by-side GT | Reconstruction grid to
-      {output_dir}/val_images/step_{global_step}.png
+      {output_dir}/val_visualizations/full/step_{global_step}.png
 
     Returns:
         {
@@ -219,15 +241,18 @@ def run_full_validation(
     from diffusers import DDIMScheduler as HFDDIMScheduler
     from training.cfg import build_uncond_context
 
-    # Lazy-init DDIM scheduler from already-loaded DDPM config.
-    ddim_sched = HFDDIMScheduler(
-        num_train_timesteps=1000,
-        beta_start=0.00085,
-        beta_end=0.012,
-        beta_schedule="scaled_linear",
-        clip_sample=False,
-        set_alpha_to_one=False,
-    )
+    # Load DDIM scheduler — from_pretrained picks up the correct prediction_type.
+    if model_name is not None:
+        ddim_sched = HFDDIMScheduler.from_pretrained(model_name, subfolder="scheduler")
+    else:
+        ddim_sched = HFDDIMScheduler(
+            num_train_timesteps=1000,
+            beta_start=0.00085,
+            beta_end=0.012,
+            beta_schedule="scaled_linear",
+            clip_sample=False,
+            set_alpha_to_one=False,
+        )
     ddim_sched.set_timesteps(ddim_steps)
 
     lpips_fn = None
@@ -251,32 +276,36 @@ def run_full_validation(
         B = images.shape[0]
 
         tokens, pooled = img_adapter(z_img_emb)
+
+        # Build unconditional context for CFG.
+        pooled_dim = pooled.shape[1] if pooled is not None else 0
         uncond_tokens, uncond_pooled = build_uncond_context(
-            B,
-            tokens.shape[1],
-            tokens.shape[2],
-            pooled.shape[1],
-            device,
+            B, tokens.shape[1], tokens.shape[2], device,
+            pooled_proj_dim=pooled_dim,
         )
 
-        resolution = images.shape[-1]
         latent_h = latent_w = resolution // 8
-        time_ids = torch.tensor(
-            [resolution, resolution, 0, 0, resolution, resolution],
-            dtype=torch.float32, device=device,
-        ).unsqueeze(0).expand(B, -1)
 
         # DDIM denoising loop.
         x = torch.randn(B, 4, latent_h, latent_w, device=device)
         for t in ddim_sched.timesteps:
             t_batch = torch.full((B,), t, device=device, dtype=torch.long)
             if cfg_scale > 1.0:
-                eps_cond   = unet(x, t_batch, tokens, pooled, time_ids)
-                eps_uncond = unet(x, t_batch, uncond_tokens, uncond_pooled, time_ids)
-                eps = eps_uncond + cfg_scale * (eps_cond - eps_uncond)
+                if backbone == "sd21":
+                    pred_cond   = unet(x, t_batch, tokens)
+                    pred_uncond = unet(x, t_batch, uncond_tokens)
+                else:
+                    _time_ids = _make_time_ids(B, resolution, device)
+                    pred_cond   = unet(x, t_batch, tokens,       pooled,       _time_ids)
+                    pred_uncond = unet(x, t_batch, uncond_tokens, uncond_pooled, _time_ids)
+                pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
             else:
-                eps = unet(x, t_batch, tokens, pooled, time_ids)
-            x = ddim_sched.step(eps, t, x).prev_sample
+                if backbone == "sd21":
+                    pred = unet(x, t_batch, tokens)
+                else:
+                    _time_ids = _make_time_ids(B, resolution, device)
+                    pred = unet(x, t_batch, tokens, pooled, _time_ids)
+            x = ddim_sched.step(pred, t, x).prev_sample
 
         pred_images = vae.decode(x)                             # (B, 3, H, W) in [-1, 1]
         pred_01 = (pred_images * 0.5 + 0.5).clamp(0, 1)
