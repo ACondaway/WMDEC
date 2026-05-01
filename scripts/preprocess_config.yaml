@@ -6,6 +6,10 @@ output_root: /share/project/congsheng/all-qwen-embeddings
 datasets:
   - name: robobrain-dex
     image_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex
+  - name: ego-dex
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/egodex_1fps_refreshed
+  - name: gen-ego-data
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/GenEgoData
 
   # Add more datasets here. Each `name` must be registered in
   # data/preprocessors/__init__.py. Implement BaseDatasetPreprocessor
