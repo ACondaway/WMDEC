@@ -89,58 +89,59 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
 
     def _walk_samples(self, episode_tasks: Dict[int, str]) -> List[SampleMeta]:
         """
-        Walk the videos/ tree with os.listdir() instead of glob.glob().
+        Walk the videos/ tree with os.scandir() for maximum throughput.
 
-        For millions of files this is significantly faster because:
-        - os.listdir() avoids fnmatch pattern matching overhead on every path.
-        - Episode text is resolved once per episode directory, not once per frame.
-        - No large intermediate list of full path strings is materialised by glob.
+        os.scandir() returns DirEntry objects whose .path (full path string)
+        and .name are provided by the OS directory listing with no extra
+        stat() or string-join per entry.  Compared to os.listdir():
+        - entry.path avoids constructing Path(dir) / name per file.
+        - entry.is_dir() uses the cached DirEntry inode type — no stat call.
+        - episode index and task text are resolved once per episode dir.
+        - filename stem sliced directly (name[:-4]) instead of Path(name).stem.
         """
-        videos_dir = self.image_root / "videos"
+        videos_dir = str(self.image_root / "videos")
         obs_dir_name = f"observation.images.{self._camera_key}"
-
         samples: List[SampleMeta] = []
 
         try:
-            chunk_names = sorted(os.listdir(videos_dir))
+            chunk_entries = sorted(os.scandir(videos_dir), key=lambda e: e.name)
         except FileNotFoundError:
             return samples
 
-        for chunk_name in chunk_names:
-            if not chunk_name.startswith("chunk-"):
+        for chunk_entry in chunk_entries:
+            if not chunk_entry.is_dir() or not chunk_entry.name.startswith("chunk-"):
                 continue
-            obs_dir = videos_dir / chunk_name / obs_dir_name
-            if not obs_dir.is_dir():
+            obs_dir = os.path.join(chunk_entry.path, obs_dir_name)
+            if not os.path.isdir(obs_dir):
                 continue
 
             try:
-                episode_names = sorted(os.listdir(obs_dir))
+                ep_entries = sorted(os.scandir(obs_dir), key=lambda e: e.name)
             except OSError:
                 continue
 
-            for ep_name in episode_names:
-                if not ep_name.startswith("episode_"):
+            for ep_entry in ep_entries:
+                if not ep_entry.is_dir() or not ep_entry.name.startswith("episode_"):
                     continue
+                ep_name = ep_entry.name
                 try:
-                    episode_index = int(ep_name.split("_")[-1])
+                    episode_index = int(ep_name.rsplit("_", 1)[-1])
                 except ValueError:
                     continue
 
-                # Resolve task text once per episode (not once per frame).
+                # Resolve task text once per episode — not once per frame.
                 task_text = episode_tasks.get(episode_index, "")
-                ep_dir = obs_dir / ep_name
 
                 try:
-                    filenames = sorted(os.listdir(ep_dir))
+                    img_entries = sorted(os.scandir(ep_entry.path), key=lambda e: e.name)
                 except OSError:
                     continue
 
-                for fname in filenames:
-                    if not fname.endswith(".jpg"):
+                for img_entry in img_entries:
+                    if not img_entry.name.endswith(".jpg"):
                         continue
-                    abs_path = ep_dir / fname
-                    stem = Path(fname).stem          # e.g. "image_0.0"
-                    flat_rel = Path(ep_name) / stem  # episode_000000/image_0.0
+                    stem = img_entry.name[:-4]           # faster than Path(name).stem
+                    flat_rel = Path(ep_name) / stem
 
                     samples.append(SampleMeta(
                         rel_path=flat_rel,
@@ -149,7 +150,7 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
                             "episode":         ep_name,
                             "episode_index":   episode_index,
                             "filename":        stem,
-                            "_abs_image_path": str(abs_path),
+                            "_abs_image_path": img_entry.path,
                         },
                     ))
 

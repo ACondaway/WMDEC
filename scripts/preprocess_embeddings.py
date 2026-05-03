@@ -147,15 +147,14 @@ def process_dataset(
     already_done = [s for s in my_samples if preprocessor.is_processed(s, processed_set)]
     pending      = [s for s in my_samples if not preprocessor.is_processed(s, processed_set)]
 
+    # All ranks participate in the reduce; only main prints.
+    total_pending_global = _reduce_int(len(pending), device)
+    total_done_global    = _reduce_int(len(already_done), device)
     if is_main:
-        total_pending_global = _reduce_int(len(pending), device)
-        total_done_global    = _reduce_int(len(already_done), device)
         print(
             f"[{preprocessor.dataset_name}]  "
             f"pending={total_pending_global:,}  cached={total_done_global:,}"
         )
-    else:
-        dist.barrier(); dist.barrier()   # match the two reduce calls on main
 
     # --- Split pending into cycles -------------------------------------------
     # Per-rank limit: max_frames_per_cycle is the *total* frame budget per cycle
@@ -216,17 +215,15 @@ def process_dataset(
 
         dist.barrier()
 
+        # All ranks reduce; only main prints.
+        cycle_written_global = _reduce_int(written_cycle, device)
         if is_main and n_cycles > 1:
-            cycle_written_global = _reduce_int(written_cycle, device)
             print(
                 f"  [{preprocessor.dataset_name}] "
                 f"Cycle {cycle_idx + 1}/{n_cycles} done — "
                 f"{cycle_written_global:,} written  "
                 f"({format_time(time.time() - cycle_t0)})"
             )
-        else:
-            if not is_main:
-                _reduce_int(written_cycle, device)   # participate in reduce
 
     elapsed = time.time() - t0
 
@@ -237,32 +234,31 @@ def process_dataset(
     total_written = _reduce_int(written_local_total, device)
     total_skipped = _reduce_int(len(already_done), device)
 
+    # all_gather_object is a collective — all ranks must call it.
+    all_key_counts = [None] * world_size
+    dist.all_gather_object(all_key_counts, key_counts_local)
+
     if is_main:
         stats.total_frames   = total_samples
         stats.skipped_frames = total_skipped
-
-        all_key_counts = [None] * world_size
-        dist.all_gather_object(all_key_counts, key_counts_local)
         merged: dict[str, int] = {}
         for kc in all_key_counts:
             for k, v in kc.items():
                 merged[k] = merged.get(k, 0) + v
-        stats.frames_per_group       = merged
+        stats.frames_per_group        = merged
         stats.processing_time_seconds = elapsed
         stats.output_size_bytes = compute_output_size(
             preprocessor.output_root, preprocessor.dataset_name
         )
-    else:
-        dist.all_gather_object([None] * world_size, key_counts_local)
 
     return stats
 
 
 def _reduce_int(val: int, device: torch.device) -> int:
-    """All-reduce a single integer across ranks; returns the sum on all ranks."""
+    """All-reduce a single integer across ranks; returns the sum on ALL ranks.
+    Must be called by every rank at the same point in the code."""
     t = torch.tensor(val, dtype=torch.long, device=device)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
-    dist.barrier()
     return t.item()
 
 
