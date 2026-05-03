@@ -22,8 +22,8 @@ Output .pt structure under {output_root}/{dataset_name}/:
 
 from __future__ import annotations
 
-import glob
 import json
+import os
 from pathlib import Path
 from typing import Dict, List
 
@@ -85,44 +85,73 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
         meta_dir = self.image_root / "meta"
         episode_tasks = _load_episodes(meta_dir)
 
-        # Glob all images across every chunk.
-        pattern = str(
-            self.image_root
-            / "videos"
-            / "chunk-*"
-            / f"observation.images.{self._camera_key}"
-            / "episode_*"
-            / "*.jpg"
-        )
-        image_paths = sorted(glob.glob(pattern))
+        return self._walk_samples(episode_tasks)
 
-        samples = []
-        for path in image_paths:
-            abs_path = Path(path)
-            episode_dir = abs_path.parent.name          # e.g. "episode_000000"
-            filename    = abs_path.stem                 # e.g. "image_0.0"
+    def _walk_samples(self, episode_tasks: Dict[int, str]) -> List[SampleMeta]:
+        """
+        Walk the videos/ tree with os.listdir() instead of glob.glob().
 
-            # Parse episode index from folder name.
-            try:
-                episode_index = int(episode_dir.split("_")[-1])
-            except ValueError:
+        For millions of files this is significantly faster because:
+        - os.listdir() avoids fnmatch pattern matching overhead on every path.
+        - Episode text is resolved once per episode directory, not once per frame.
+        - No large intermediate list of full path strings is materialised by glob.
+        """
+        videos_dir = self.image_root / "videos"
+        obs_dir_name = f"observation.images.{self._camera_key}"
+
+        samples: List[SampleMeta] = []
+
+        try:
+            chunk_names = sorted(os.listdir(videos_dir))
+        except FileNotFoundError:
+            return samples
+
+        for chunk_name in chunk_names:
+            if not chunk_name.startswith("chunk-"):
+                continue
+            obs_dir = videos_dir / chunk_name / obs_dir_name
+            if not obs_dir.is_dir():
                 continue
 
-            task_text = episode_tasks.get(episode_index, "")
+            try:
+                episode_names = sorted(os.listdir(obs_dir))
+            except OSError:
+                continue
 
-            # Flat rel_path: episode_XXXXXX/image_X.0
-            flat_rel = Path(episode_dir) / filename
+            for ep_name in episode_names:
+                if not ep_name.startswith("episode_"):
+                    continue
+                try:
+                    episode_index = int(ep_name.split("_")[-1])
+                except ValueError:
+                    continue
 
-            samples.append(SampleMeta(
-                rel_path=flat_rel,
-                extra_meta={
-                    "task_name":        task_text,
-                    "episode":          episode_dir,
-                    "episode_index":    episode_index,
-                    "filename":         filename,
-                    "_abs_image_path":  str(abs_path),
-                },
-            ))
+                # Resolve task text once per episode (not once per frame).
+                task_text = episode_tasks.get(episode_index, "")
+                ep_dir = obs_dir / ep_name
+
+                try:
+                    filenames = sorted(os.listdir(ep_dir))
+                except OSError:
+                    continue
+
+                for fname in filenames:
+                    if not fname.endswith(".jpg"):
+                        continue
+                    abs_path = ep_dir / fname
+                    stem = Path(fname).stem          # e.g. "image_0.0"
+                    flat_rel = Path(ep_name) / stem  # episode_000000/image_0.0
+
+                    samples.append(SampleMeta(
+                        rel_path=flat_rel,
+                        extra_meta={
+                            "task_name":       task_text,
+                            "episode":         ep_name,
+                            "episode_index":   episode_index,
+                            "filename":        stem,
+                            "_abs_image_path": str(abs_path),
+                        },
+                    ))
 
         return samples
 
@@ -145,38 +174,4 @@ class LeRobotWithoutTextPreprocessor(LeRobotPreprocessor):
     """
 
     def find_samples(self) -> List[SampleMeta]:
-        pattern = str(
-            self.image_root
-            / "videos"
-            / "chunk-*"
-            / f"observation.images.{self._camera_key}"
-            / "episode_*"
-            / "*.jpg"
-        )
-        image_paths = sorted(glob.glob(pattern))
-
-        samples = []
-        for path in image_paths:
-            abs_path = Path(path)
-            episode_dir = abs_path.parent.name
-            filename    = abs_path.stem
-
-            try:
-                episode_index = int(episode_dir.split("_")[-1])
-            except ValueError:
-                continue
-
-            flat_rel = Path(episode_dir) / filename
-
-            samples.append(SampleMeta(
-                rel_path=flat_rel,
-                extra_meta={
-                    "task_name":        "",
-                    "episode":          episode_dir,
-                    "episode_index":    episode_index,
-                    "filename":         filename,
-                    "_abs_image_path":  str(abs_path),
-                },
-            ))
-
-        return samples
+        return self._walk_samples(episode_tasks={})

@@ -18,9 +18,10 @@ from __future__ import annotations
 import os
 import time
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List
+from typing import List, FrozenSet, Optional
 
 import torch
 from PIL import Image
@@ -51,6 +52,7 @@ class BaseDatasetPreprocessor(ABC):
         load_image()             — load a PIL.Image given a SampleMeta
 
     The base class provides:
+        build_processed_set()    — scan output dir once → frozenset of existing paths
         output_path()            — maps a sample to its .pt output path
         is_processed()           — True if the .pt already exists (for resuming)
         save_embedding()         — atomically writes the embedding .pt file
@@ -87,12 +89,44 @@ class BaseDatasetPreprocessor(ABC):
     # Provided helpers
     # ------------------------------------------------------------------
 
+    def build_processed_set(self) -> FrozenSet[str]:
+        """
+        Scan the output directory ONCE and return all existing .pt paths as a
+        frozenset of absolute path strings.
+
+        Use this before the main loop to avoid per-sample stat() calls.
+        For millions of files, one os.walk pass is orders of magnitude faster
+        than N individual Path.exists() calls.
+
+        Pass the result to is_processed() and process_batch() as `processed_set`.
+        """
+        out_dir = self.output_root / self.dataset_name
+        if not out_dir.exists():
+            return frozenset()
+        existing: set[str] = set()
+        for dirpath, _, filenames in os.walk(out_dir):
+            for fname in filenames:
+                if fname.endswith(".pt"):
+                    existing.add(os.path.join(dirpath, fname))
+        return frozenset(existing)
+
     def output_path(self, sample: SampleMeta) -> Path:
         """Derive the .pt output path from the sample's relative image path."""
         return self.output_root / self.dataset_name / sample.rel_path.with_suffix(".pt")
 
-    def is_processed(self, sample: SampleMeta) -> bool:
-        """Return True if the embedding file already exists (allows resuming)."""
+    def is_processed(
+        self,
+        sample: SampleMeta,
+        processed_set: Optional[FrozenSet[str]] = None,
+    ) -> bool:
+        """
+        Return True if the embedding file already exists.
+
+        If `processed_set` is provided (built via build_processed_set()), uses
+        an O(1) set lookup instead of a filesystem stat() call.
+        """
+        if processed_set is not None:
+            return str(self.output_path(sample)) in processed_set
         return self.output_path(sample).exists()
 
     def save_embedding(self, sample: SampleMeta, z_img: torch.Tensor) -> None:
@@ -114,17 +148,40 @@ class BaseDatasetPreprocessor(ABC):
         batch_samples: List[SampleMeta],
         encoder,
         device: torch.device,
+        processed_set: Optional[FrozenSet[str]] = None,
+        num_io_workers: int = 8,
     ) -> int:
         """
         Encode a batch of images and save their embeddings.
 
+        Args:
+            batch_samples:  Samples to process (already sharded to this rank).
+            encoder:        QwenVisualEncoder instance.
+            device:         CUDA device.
+            processed_set:  Frozenset from build_processed_set() for O(1) skip checks.
+                            Falls back to per-file stat() if None.
+            num_io_workers: ThreadPoolExecutor workers for parallel image loading.
+
         Returns the number of samples actually written (skips already-processed).
         """
-        to_process = [s for s in batch_samples if not self.is_processed(s)]
+        to_process = [s for s in batch_samples if not self.is_processed(s, processed_set)]
         if not to_process:
             return 0
 
-        images = [self.load_image(s) for s in to_process]
+        # Create all unique parent directories in one pass — avoids one mkdir
+        # syscall per sample when many samples share the same parent dir.
+        seen_parents: set[Path] = set()
+        for s in to_process:
+            p = self.output_path(s).parent
+            if p not in seen_parents:
+                p.mkdir(parents=True, exist_ok=True)
+                seen_parents.add(p)
+
+        # Load images in parallel — image decoding is I/O + CPU bound; threading
+        # overlaps disk reads and PIL decoding across multiple files at once.
+        with ThreadPoolExecutor(max_workers=num_io_workers) as pool:
+            images = list(pool.map(self.load_image, to_process))
+
         patch_embeds = encoder.encode_images(images, device=device).to(torch.bfloat16)
 
         for i, sample in enumerate(to_process):

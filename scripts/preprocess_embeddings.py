@@ -104,8 +104,15 @@ def process_dataset(
 
     my_samples = shard(all_samples, rank, world_size)
 
-    # Count how many already exist (for skip stats)
-    already_done = sum(1 for s in my_samples if preprocessor.is_processed(s))
+    # Scan the output directory ONCE per rank to build a set of existing .pt paths.
+    # This replaces N individual stat() calls (one per sample) with a single
+    # os.walk pass, which is orders of magnitude faster for millions of files.
+    if is_main:
+        print(f"[{preprocessor.dataset_name}] Scanning existing embeddings ...")
+    processed_set = preprocessor.build_processed_set()
+
+    # Count already-done samples via O(1) set lookup instead of per-file stat().
+    already_done = sum(1 for s in my_samples if preprocessor.is_processed(s, processed_set))
 
     t0 = time.time()
     written_local = 0
@@ -120,7 +127,7 @@ def process_dataset(
 
     for i in pbar:
         batch = my_samples[i : i + batch_size]
-        n_written = preprocessor.process_batch(batch, encoder, device)
+        n_written = preprocessor.process_batch(batch, encoder, device, processed_set=processed_set)
         written_local += n_written
 
         # Accumulate group counts (all samples, not just written)
