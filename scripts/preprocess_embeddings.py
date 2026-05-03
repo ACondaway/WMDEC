@@ -18,6 +18,19 @@ Usage — multiple datasets in one launch (sequential, each on all GPUs):
         --config scripts/preprocess_config.yaml \\
         --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
 
+Usage — limit frames per cycle (recommended for millions of files):
+    torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \\
+        --config scripts/preprocess_config.yaml \\
+        --encoder_ckpt ... \\
+        --max_frames_per_cycle 50000
+
+Cycle mode (--max_frames_per_cycle > 0):
+    Unprocessed samples are split into chunks of `max_frames_per_cycle` total
+    frames (divided evenly across GPUs).  Each cycle is processed sequentially
+    with a progress line printed between cycles.  All cycle stats are aggregated
+    into the final per-dataset report.  The processed_set from the previous
+    cycle is updated in-memory so no re-scanning is needed between cycles.
+
 preprocess_config.yaml format:
     output_root: /share/project/congsheng/all-embeddings
     datasets:
@@ -39,9 +52,13 @@ robobrain-dex:
     Text: task_name folder name.  No meta file needed.
 
 lerobot:
-    {image_root}/meta/episodes.jsonl   ← task per episode
+    {image_root}/meta/episodes.jsonl   <- task per episode
     {image_root}/videos/chunk-*/observation.images.{camera_key}/episode_*/image_*.jpg
     Supports any dataset name; add new datasets only in the YAML, no code change.
+
+lerobot_without_text:
+    Same layout as lerobot but skips meta/episodes.jsonl entirely.
+    task_name is always "" — no text encoder pass triggered.
 """
 
 import os
@@ -66,6 +83,7 @@ from data.stats import (
     print_combined_stats,
     save_stats,
     save_combined_stats,
+    format_time,
 )
 
 
@@ -82,6 +100,12 @@ def shard(samples, rank, world_size):
     return samples[rank::world_size]
 
 
+def _chunk(lst, n):
+    """Split list into chunks of at most n elements."""
+    for i in range(0, len(lst), n):
+        yield lst[i : i + n]
+
+
 def process_dataset(
     preprocessor: BaseDatasetPreprocessor,
     encoder: QwenVisualEncoder,
@@ -90,8 +114,18 @@ def process_dataset(
     rank: int,
     world_size: int,
     is_main: bool,
+    max_frames_per_cycle: int = 0,
 ) -> DatasetStats:
-    """Run preprocessing for one dataset across all ranks. Returns stats (rank 0 only)."""
+    """
+    Run preprocessing for one dataset across all ranks.
+
+    If max_frames_per_cycle > 0, unprocessed samples are split into cycles
+    of at most max_frames_per_cycle total frames (across all GPUs).  Each
+    cycle is processed sequentially; per-cycle stats are accumulated and
+    reported at the end.
+
+    Returns aggregated DatasetStats (populated on rank 0).
+    """
 
     if is_main:
         print(f"\n[{preprocessor.dataset_name}] Finding samples ...")
@@ -100,82 +134,136 @@ def process_dataset(
     all_samples = preprocessor.find_samples()
 
     if is_main:
-        print(f"[{preprocessor.dataset_name}] Found {len(all_samples):,} samples")
+        print(f"[{preprocessor.dataset_name}] Found {len(all_samples):,} total samples")
 
     my_samples = shard(all_samples, rank, world_size)
 
-    # Scan the output directory ONCE per rank to build a set of existing .pt paths.
-    # This replaces N individual stat() calls (one per sample) with a single
-    # os.walk pass, which is orders of magnitude faster for millions of files.
+    # Scan output directory ONCE — replaces N individual stat() calls.
     if is_main:
         print(f"[{preprocessor.dataset_name}] Scanning existing embeddings ...")
-    processed_set = preprocessor.build_processed_set()
+    processed_set = set(preprocessor.build_processed_set())  # mutable set; updated each cycle
 
-    # Count already-done samples via O(1) set lookup instead of per-file stat().
-    already_done = sum(1 for s in my_samples if preprocessor.is_processed(s, processed_set))
-
-    t0 = time.time()
-    written_local = 0
-    key_counts_local: dict[str, int] = {}
-
-    pbar = tqdm(
-        range(0, len(my_samples), batch_size),
-        desc=f"[GPU {rank}] {preprocessor.dataset_name}",
-        disable=(rank != 0),
-        dynamic_ncols=True,
-    )
-
-    for i in pbar:
-        batch = my_samples[i : i + batch_size]
-        n_written = preprocessor.process_batch(batch, encoder, device, processed_set=processed_set)
-        written_local += n_written
-
-        # Accumulate group counts (all samples, not just written)
-        for s in batch:
-            key = preprocessor.stats_key(s)
-            key_counts_local[key] = key_counts_local.get(key, 0) + 1
-
-    dist.barrier()
-    elapsed = time.time() - t0
-
-    # Aggregate stats on rank 0 via all_reduce / gather
-    stats = DatasetStats(dataset_name=preprocessor.dataset_name)
-
-    if dist.is_available() and dist.is_initialized():
-        # Reduce scalar counts
-        def reduce_int(val: int) -> int:
-            t = torch.tensor(val, dtype=torch.long, device=device)
-            dist.all_reduce(t, op=dist.ReduceOp.SUM)
-            return t.item()
-
-        total_samples = reduce_int(len(my_samples))
-        total_written = reduce_int(written_local)
-        total_skipped = reduce_int(already_done)
-
-        if is_main:
-            stats.total_frames = total_samples
-            stats.written_frames_override = total_written  # not a real field, just for display
-            stats.skipped_frames = total_skipped
-    else:
-        stats.total_frames = len(my_samples)
-        stats.skipped_frames = already_done
-
-    # Gather per-group counts to rank 0
-    all_key_counts = [None] * world_size
-    dist.all_gather_object(all_key_counts, key_counts_local)
+    # Separate already-done from pending so cycles only touch new work.
+    already_done = [s for s in my_samples if preprocessor.is_processed(s, processed_set)]
+    pending      = [s for s in my_samples if not preprocessor.is_processed(s, processed_set)]
 
     if is_main:
+        total_pending_global = _reduce_int(len(pending), device)
+        total_done_global    = _reduce_int(len(already_done), device)
+        print(
+            f"[{preprocessor.dataset_name}]  "
+            f"pending={total_pending_global:,}  cached={total_done_global:,}"
+        )
+    else:
+        dist.barrier(); dist.barrier()   # match the two reduce calls on main
+
+    # --- Split pending into cycles -------------------------------------------
+    # Per-rank limit: max_frames_per_cycle is the *total* frame budget per cycle
+    # across all GPUs, so each rank handles max_frames_per_cycle // world_size.
+    if max_frames_per_cycle > 0 and len(pending) > 0:
+        per_rank_limit = max(1, max_frames_per_cycle // world_size)
+        cycles = list(_chunk(pending, per_rank_limit))
+    else:
+        cycles = [pending] if pending else []
+
+    n_cycles = len(cycles)
+
+    # ---- Accumulate stats across cycles ----
+    t0 = time.time()
+    written_local_total  = 0
+    key_counts_local: dict[str, int] = {}
+
+    for cycle_idx, cycle_samples in enumerate(cycles):
+        cycle_t0 = time.time()
+
+        if is_main and n_cycles > 1:
+            start_frame = cycle_idx * (max_frames_per_cycle // world_size)
+            print(
+                f"\n  [{preprocessor.dataset_name}] "
+                f"Cycle {cycle_idx + 1}/{n_cycles} — "
+                f"~{len(cycle_samples) * world_size:,} frames this cycle"
+            )
+
+        pbar = tqdm(
+            range(0, len(cycle_samples), batch_size),
+            desc=(
+                f"[GPU {rank}] {preprocessor.dataset_name}"
+                + (f" [{cycle_idx+1}/{n_cycles}]" if n_cycles > 1 else "")
+            ),
+            disable=(rank != 0),
+            dynamic_ncols=True,
+        )
+
+        written_cycle = 0
+        for i in pbar:
+            batch = cycle_samples[i : i + batch_size]
+            n_written = preprocessor.process_batch(
+                batch, encoder, device, processed_set=processed_set
+            )
+            written_cycle += n_written
+
+            # Track newly written paths so next cycle's processed_set is current.
+            if n_written:
+                for s in batch:
+                    processed_set.add(str(preprocessor.output_path(s)))
+
+            # Accumulate group counts for this cycle.
+            for s in batch:
+                key = preprocessor.stats_key(s)
+                key_counts_local[key] = key_counts_local.get(key, 0) + 1
+
+        written_local_total += written_cycle
+
+        dist.barrier()
+
+        if is_main and n_cycles > 1:
+            cycle_written_global = _reduce_int(written_cycle, device)
+            print(
+                f"  [{preprocessor.dataset_name}] "
+                f"Cycle {cycle_idx + 1}/{n_cycles} done — "
+                f"{cycle_written_global:,} written  "
+                f"({format_time(time.time() - cycle_t0)})"
+            )
+        else:
+            if not is_main:
+                _reduce_int(written_cycle, device)   # participate in reduce
+
+    elapsed = time.time() - t0
+
+    # ---- Aggregate final stats across all ranks ----
+    stats = DatasetStats(dataset_name=preprocessor.dataset_name)
+
+    total_samples = _reduce_int(len(my_samples), device)
+    total_written = _reduce_int(written_local_total, device)
+    total_skipped = _reduce_int(len(already_done), device)
+
+    if is_main:
+        stats.total_frames   = total_samples
+        stats.skipped_frames = total_skipped
+
+        all_key_counts = [None] * world_size
+        dist.all_gather_object(all_key_counts, key_counts_local)
         merged: dict[str, int] = {}
         for kc in all_key_counts:
             for k, v in kc.items():
                 merged[k] = merged.get(k, 0) + v
-        stats.frames_per_group = merged
+        stats.frames_per_group       = merged
         stats.processing_time_seconds = elapsed
         stats.output_size_bytes = compute_output_size(
             preprocessor.output_root, preprocessor.dataset_name
         )
+    else:
+        dist.all_gather_object([None] * world_size, key_counts_local)
 
     return stats
+
+
+def _reduce_int(val: int, device: torch.device) -> int:
+    """All-reduce a single integer across ranks; returns the sum on all ranks."""
+    t = torch.tensor(val, dtype=torch.long, device=device)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    dist.barrier()
+    return t.item()
 
 
 def main():
@@ -183,6 +271,14 @@ def main():
     parser.add_argument("--encoder_ckpt", type=str, required=True,
                         help="Path to standalone Qwen visual encoder .pt")
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument(
+        "--max_frames_per_cycle", type=int, default=0,
+        help=(
+            "Maximum total frames to process per cycle across all GPUs. "
+            "0 = no limit (process everything in one pass). "
+            "Recommended: 50000 for datasets with millions of files."
+        ),
+    )
 
     # Single-dataset mode
     parser.add_argument("--dataset", type=str, default=None,
@@ -200,15 +296,14 @@ def main():
     device = torch.device(f"cuda:{local_rank}")
     is_main = rank == 0
 
-    # Build job list — each entry is a dict with name, image_dir, output_root,
-    # schema_type, and any extra kwargs forwarded to the preprocessor constructor.
+    # Build job list
     if args.config:
         with open(args.config) as f:
             cfg = yaml.safe_load(f)
         output_root = Path(cfg["output_root"])
         jobs = []
         for d in cfg["datasets"]:
-            schema_type = d.get("type", d["name"])  # fall back to name if type omitted
+            schema_type = d.get("type", d["name"])
             extra = {k: v for k, v in d.items()
                      if k not in ("name", "image_dir", "type")}
             jobs.append({
@@ -229,7 +324,6 @@ def main():
     else:
         parser.error("Provide either --config or (--dataset + --image_dir + --output_dir)")
 
-    # Validate schema types
     for job in jobs:
         if job["type"] not in PREPROCESSORS:
             raise ValueError(
@@ -240,6 +334,11 @@ def main():
 
     if is_main:
         print(f"Running on {world_size} GPU(s)")
+        if args.max_frames_per_cycle > 0:
+            print(
+                f"Cycle mode: {args.max_frames_per_cycle:,} frames/cycle total  "
+                f"({args.max_frames_per_cycle // world_size:,} per GPU)"
+            )
         print(f"Loading Qwen visual encoder from {args.encoder_ckpt} ...")
 
     encoder = QwenVisualEncoder.from_standalone(args.encoder_ckpt).to(device)
@@ -249,21 +348,18 @@ def main():
 
     for job in jobs:
         preprocessor_cls = PREPROCESSORS[job["type"]]
-        # Pass name and any extra YAML keys (e.g. camera_key) to the constructor.
-        # RoboBrainDexPreprocessor ignores unknown kwargs via **extra (see below).
         try:
             preprocessor = preprocessor_cls(
                 job["image_dir"], str(job["output_root"]),
                 name=job["name"], **job["extra"],
             )
         except TypeError:
-            # Schema class (e.g. RoboBrainDexPreprocessor) has a fixed name —
-            # fall back to positional-only construction.
             preprocessor = preprocessor_cls(job["image_dir"], str(job["output_root"]))
 
         stats = process_dataset(
             preprocessor, encoder, device,
             args.batch_size, rank, world_size, is_main,
+            max_frames_per_cycle=args.max_frames_per_cycle,
         )
 
         if is_main:
