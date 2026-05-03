@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import List
+from typing import Iterator
 
 from PIL import Image
 
@@ -26,25 +26,20 @@ class RoboBrainDexPreprocessor(BaseDatasetPreprocessor):
     def dataset_name(self) -> str:
         return "robobrain-dex"
 
-    def find_samples(self) -> List[SampleMeta]:
+    def iter_samples(self) -> Iterator[SampleMeta]:
         """
-        Walk the dataset tree with os.scandir() instead of glob.glob().
+        Stream SampleMeta objects one at a time via os.scandir().
 
-        glob.glob() has per-path fnmatch overhead and builds the full path
-        list in memory before returning.  os.scandir() returns DirEntry
-        objects whose .path and .name are already computed by the OS during
-        the directory listing — no extra stat() or string join per file.
-
-        task_name and episode are resolved once per directory level, not
-        once per frame.
+        Yields immediately as each file is discovered — no upfront list is
+        built in memory.  task_name and episode are resolved once per
+        directory level, not once per frame.
         """
-        samples: List[SampleMeta] = []
         obs_subpath = os.path.join("videos", "chunk-000", "observation.images.image_top")
 
         try:
             task_entries = sorted(os.scandir(self.image_root), key=lambda e: e.name)
         except FileNotFoundError:
-            return samples
+            return
 
         for task_entry in task_entries:
             if not task_entry.is_dir():
@@ -72,21 +67,16 @@ class RoboBrainDexPreprocessor(BaseDatasetPreprocessor):
                 for img_entry in img_entries:
                     if not img_entry.name.endswith(".jpg"):
                         continue
-                    # Slice off ".jpg" — faster than Path(name).stem for a known extension.
-                    filename = img_entry.name[:-4]
-                    flat_rel = Path(task_name) / episode / filename
-
-                    samples.append(SampleMeta(
-                        rel_path=flat_rel,
+                    filename = img_entry.name[:-4]   # faster than Path(name).stem
+                    yield SampleMeta(
+                        rel_path=Path(task_name) / episode / filename,
                         extra_meta={
                             "task_name":       task_name,
                             "episode":         episode,
                             "filename":        filename,
                             "_abs_image_path": img_entry.path,
                         },
-                    ))
-
-        return samples
+                    )
 
     def load_image(self, sample: SampleMeta) -> Image.Image:
         return Image.open(sample.extra_meta["_abs_image_path"]).convert("RGB")

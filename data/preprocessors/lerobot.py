@@ -25,7 +25,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, Iterator
 
 from PIL import Image
 
@@ -80,33 +80,25 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
     def dataset_name(self) -> str:
         return self._name
 
-    def find_samples(self) -> List[SampleMeta]:
-        # Load episode → task mapping from meta/episodes.jsonl.
+    def iter_samples(self) -> Iterator[SampleMeta]:
         meta_dir = self.image_root / "meta"
         episode_tasks = _load_episodes(meta_dir)
+        yield from self._iter_walk(episode_tasks)
 
-        return self._walk_samples(episode_tasks)
-
-    def _walk_samples(self, episode_tasks: Dict[int, str]) -> List[SampleMeta]:
+    def _iter_walk(self, episode_tasks: Dict[int, str]) -> Iterator[SampleMeta]:
         """
-        Walk the videos/ tree with os.scandir() for maximum throughput.
+        Stream SampleMeta objects one at a time via os.scandir().
 
-        os.scandir() returns DirEntry objects whose .path (full path string)
-        and .name are provided by the OS directory listing with no extra
-        stat() or string-join per entry.  Compared to os.listdir():
-        - entry.path avoids constructing Path(dir) / name per file.
-        - entry.is_dir() uses the cached DirEntry inode type — no stat call.
-        - episode index and task text are resolved once per episode dir.
-        - filename stem sliced directly (name[:-4]) instead of Path(name).stem.
+        Yields immediately as each file is discovered — no list is built.
+        Episode text is resolved once per episode directory, not per frame.
         """
         videos_dir = str(self.image_root / "videos")
         obs_dir_name = f"observation.images.{self._camera_key}"
-        samples: List[SampleMeta] = []
 
         try:
             chunk_entries = sorted(os.scandir(videos_dir), key=lambda e: e.name)
         except FileNotFoundError:
-            return samples
+            return
 
         for chunk_entry in chunk_entries:
             if not chunk_entry.is_dir() or not chunk_entry.name.startswith("chunk-"):
@@ -129,7 +121,6 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
                 except ValueError:
                     continue
 
-                # Resolve task text once per episode — not once per frame.
                 task_text = episode_tasks.get(episode_index, "")
 
                 try:
@@ -140,11 +131,9 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
                 for img_entry in img_entries:
                     if not img_entry.name.endswith(".jpg"):
                         continue
-                    stem = img_entry.name[:-4]           # faster than Path(name).stem
-                    flat_rel = Path(ep_name) / stem
-
-                    samples.append(SampleMeta(
-                        rel_path=flat_rel,
+                    stem = img_entry.name[:-4]
+                    yield SampleMeta(
+                        rel_path=Path(ep_name) / stem,
                         extra_meta={
                             "task_name":       task_text,
                             "episode":         ep_name,
@@ -152,9 +141,7 @@ class LeRobotPreprocessor(BaseDatasetPreprocessor):
                             "filename":        stem,
                             "_abs_image_path": img_entry.path,
                         },
-                    ))
-
-        return samples
+                    )
 
     def load_image(self, sample: SampleMeta) -> Image.Image:
         return Image.open(sample.extra_meta["_abs_image_path"]).convert("RGB")
@@ -174,5 +161,5 @@ class LeRobotWithoutTextPreprocessor(LeRobotPreprocessor):
     Use type="lerobot_without_text" in preprocess_config.yaml.
     """
 
-    def find_samples(self) -> List[SampleMeta]:
-        return self._walk_samples(episode_tasks={})
+    def iter_samples(self) -> Iterator[SampleMeta]:
+        yield from self._iter_walk(episode_tasks={})

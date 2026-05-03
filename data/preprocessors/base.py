@@ -3,7 +3,7 @@ Abstract base class for offline dataset preprocessing.
 
 To add a new dataset:
 1. Subclass BaseDatasetPreprocessor.
-2. Implement `dataset_name`, `find_samples()`, and `load_image()`.
+2. Implement `dataset_name`, `iter_samples()`, and `load_image()`.
 3. Register it in data/preprocessors/__init__.py under PREPROCESSORS.
 
 The framework handles:
@@ -11,17 +11,28 @@ The framework handles:
   - Skip-already-processed logic (resume support)
   - Saving embeddings in a consistent .pt format
   - Statistics collection and reporting
+
+Streaming design
+----------------
+iter_samples() is a generator — it yields SampleMeta objects one at a time
+without ever materialising the full dataset list in memory.  For millions of
+files this avoids gigabytes of RAM for SampleMeta objects.
+
+iter_samples_for_rank() wraps iter_samples() with modulo interleaving so each
+GPU rank receives only its share of the stream without any upfront shard list.
+
+find_samples() is kept as a convenience wrapper (list(iter_samples())) for
+callers that need a full list, but is no longer used by the main pipeline.
 """
 
 from __future__ import annotations
 
 import os
-import time
 from abc import ABC, abstractmethod
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, FrozenSet, Optional
+from typing import FrozenSet, Iterator, List, Optional
 
 import torch
 from PIL import Image
@@ -33,10 +44,8 @@ class SampleMeta:
     Minimal descriptor for a single data sample.
 
     Attributes:
-        rel_path:   Path relative to `image_root` (used to derive the output .pt path
-                    by replacing the extension with .pt under `output_root`).
-        extra_meta: Arbitrary key-value pairs stored alongside the embedding in the .pt file.
-                    Use this for task name, episode, split, etc.
+        rel_path:   Path relative to `image_root` (used to derive the output .pt path).
+        extra_meta: Arbitrary key-value pairs stored in the .pt file alongside the embedding.
     """
     rel_path: Path
     extra_meta: dict = field(default_factory=dict)
@@ -48,19 +57,14 @@ class BaseDatasetPreprocessor(ABC):
 
     Subclasses must implement:
         dataset_name  (property) — unique string identifier, e.g. "robobrain-dex"
-        find_samples()           — return all SampleMeta for this dataset
+        iter_samples()           — generator that yields SampleMeta one at a time
         load_image()             — load a PIL.Image given a SampleMeta
 
-    The base class provides:
-        build_processed_set()    — scan output dir once → frozenset of existing paths
-        output_path()            — maps a sample to its .pt output path
-        is_processed()           — True if the .pt already exists (for resuming)
-        save_embedding()         — atomically writes the embedding .pt file
-        process_batch()          — encode a batch and save all files
+    The base class provides everything else.
     """
 
     def __init__(self, image_root: str, output_root: str):
-        self.image_root = Path(image_root)
+        self.image_root  = Path(image_root)
         self.output_root = Path(output_root)
 
     # ------------------------------------------------------------------
@@ -73,12 +77,12 @@ class BaseDatasetPreprocessor(ABC):
         """Unique identifier used as the top-level subdirectory under output_root."""
 
     @abstractmethod
-    def find_samples(self) -> List[SampleMeta]:
+    def iter_samples(self) -> Iterator[SampleMeta]:
         """
-        Discover all processable samples in the dataset.
+        Yield SampleMeta objects in a deterministic order, one at a time.
 
-        Returns a list of SampleMeta sorted deterministically so every rank
-        produces the same global ordering before sharding.
+        Must produce the same ordering on every call and on every rank so that
+        modulo interleaving in iter_samples_for_rank() partitions consistently.
         """
 
     @abstractmethod
@@ -86,7 +90,32 @@ class BaseDatasetPreprocessor(ABC):
         """Load and return a PIL RGB image for the given sample."""
 
     # ------------------------------------------------------------------
-    # Provided helpers
+    # Streaming helpers
+    # ------------------------------------------------------------------
+
+    def iter_samples_for_rank(
+        self,
+        rank: int,
+        world_size: int,
+    ) -> Iterator[SampleMeta]:
+        """
+        Yield only this rank's share of the global sample stream.
+
+        Uses modulo interleaving: rank r receives samples at global indices
+        [r, r + world_size, r + 2*world_size, ...].  Because iter_samples()
+        produces a deterministic order, every rank gets a consistent, disjoint
+        subset with no coordination needed between ranks.
+        """
+        for i, sample in enumerate(self.iter_samples()):
+            if i % world_size == rank:
+                yield sample
+
+    def find_samples(self) -> List[SampleMeta]:
+        """Convenience wrapper — materialises iter_samples() into a list."""
+        return list(self.iter_samples())
+
+    # ------------------------------------------------------------------
+    # Output path / resume helpers
     # ------------------------------------------------------------------
 
     def build_processed_set(self) -> FrozenSet[str]:
@@ -94,11 +123,8 @@ class BaseDatasetPreprocessor(ABC):
         Scan the output directory ONCE and return all existing .pt paths as a
         frozenset of absolute path strings.
 
-        Use this before the main loop to avoid per-sample stat() calls.
-        For millions of files, one os.walk pass is orders of magnitude faster
-        than N individual Path.exists() calls.
-
-        Pass the result to is_processed() and process_batch() as `processed_set`.
+        One os.walk pass is orders of magnitude faster than individual
+        Path.exists() calls for millions of files.
         """
         out_dir = self.output_root / self.dataset_name
         if not out_dir.exists():
@@ -111,7 +137,6 @@ class BaseDatasetPreprocessor(ABC):
         return frozenset(existing)
 
     def output_path(self, sample: SampleMeta) -> Path:
-        """Derive the .pt output path from the sample's relative image path."""
         return self.output_root / self.dataset_name / sample.rel_path.with_suffix(".pt")
 
     def is_processed(
@@ -119,12 +144,6 @@ class BaseDatasetPreprocessor(ABC):
         sample: SampleMeta,
         processed_set: Optional[FrozenSet[str]] = None,
     ) -> bool:
-        """
-        Return True if the embedding file already exists.
-
-        If `processed_set` is provided (built via build_processed_set()), uses
-        an O(1) set lookup instead of a filesystem stat() call.
-        """
         if processed_set is not None:
             return str(self.output_path(sample)) in processed_set
         return self.output_path(sample).exists()
@@ -133,12 +152,7 @@ class BaseDatasetPreprocessor(ABC):
         """Write embedding tensor + metadata to disk atomically via a temp file."""
         out = self.output_path(sample)
         out.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "z_img": z_img.cpu(),
-            "dataset_name": self.dataset_name,
-            **sample.extra_meta,
-        }
-        # Write to .tmp then rename — avoids corrupt files if interrupted
+        payload = {"z_img": z_img.cpu(), "dataset_name": self.dataset_name, **sample.extra_meta}
         tmp = out.with_suffix(".tmp")
         torch.save(payload, tmp)
         tmp.rename(out)
@@ -152,24 +166,15 @@ class BaseDatasetPreprocessor(ABC):
         num_io_workers: int = 8,
     ) -> int:
         """
-        Encode a batch of images and save their embeddings.
+        Encode a batch and save embeddings.  Returns number of samples written.
 
-        Args:
-            batch_samples:  Samples to process (already sharded to this rank).
-            encoder:        QwenVisualEncoder instance.
-            device:         CUDA device.
-            processed_set:  Frozenset from build_processed_set() for O(1) skip checks.
-                            Falls back to per-file stat() if None.
-            num_io_workers: ThreadPoolExecutor workers for parallel image loading.
-
-        Returns the number of samples actually written (skips already-processed).
+        Skips samples already in processed_set.  Parent dirs are created in a
+        single batched pass.  Images are loaded in parallel via ThreadPoolExecutor.
         """
         to_process = [s for s in batch_samples if not self.is_processed(s, processed_set)]
         if not to_process:
             return 0
 
-        # Create all unique parent directories in one pass — avoids one mkdir
-        # syscall per sample when many samples share the same parent dir.
         seen_parents: set[Path] = set()
         for s in to_process:
             p = self.output_path(s).parent
@@ -177,26 +182,17 @@ class BaseDatasetPreprocessor(ABC):
                 p.mkdir(parents=True, exist_ok=True)
                 seen_parents.add(p)
 
-        # Load images in parallel — image decoding is I/O + CPU bound; threading
-        # overlaps disk reads and PIL decoding across multiple files at once.
         with ThreadPoolExecutor(max_workers=num_io_workers) as pool:
             images = list(pool.map(self.load_image, to_process))
 
         patch_embeds = encoder.encode_images(images, device=device).to(torch.bfloat16)
-
         for i, sample in enumerate(to_process):
             self.save_embedding(sample, patch_embeds[i])
-
         return len(to_process)
 
     # ------------------------------------------------------------------
-    # Optional override: per-sample metadata for statistics
+    # Optional override
     # ------------------------------------------------------------------
 
     def stats_key(self, sample: SampleMeta) -> str:
-        """
-        Return a grouping key for statistics (e.g. task name, split).
-        Override to get per-group breakdowns in the statistics report.
-        Defaults to dataset_name (single group).
-        """
         return sample.extra_meta.get("task_name", self.dataset_name)
