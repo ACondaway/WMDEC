@@ -163,8 +163,17 @@ def train(config: dict, resume_path: str = None):
         if is_main:
             print(f"Resuming from {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
-        raw_unet.load_state_dict(ckpt["unet"])
         raw_adapter.load_state_dict(ckpt["img_adapter"])
+        if training_mode == "lora":
+            # LoRA adapter saved in sibling dir lora_step_N/ — load before compile
+            lora_dir = os.path.join(
+                os.path.dirname(resume_path), f"lora_step_{ckpt['step']}"
+            )
+            raw_unet.load_lora(lora_dir)
+            if is_main:
+                print(f"  Loaded LoRA adapter from {lora_dir}")
+        else:
+            raw_unet.load_state_dict(ckpt["unet"])
         optimizer_state  = ckpt.get("optimizer")
         lr_sched_state   = ckpt.get("lr_scheduler")
         scaler_state     = ckpt.get("scaler")
@@ -423,12 +432,16 @@ def train(config: dict, resume_path: str = None):
                     if best_tracker.update(val_metrics, global_step):
                         ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
                         os.makedirs(ckpt_dir, exist_ok=True)
-                        torch.save({
+                        best_payload = {
                             "step": global_step,
-                            "unet": unet.module.state_dict(),
                             "img_adapter": img_adapter.module.state_dict(),
                             "val_metrics": val_metrics,
-                        }, os.path.join(ckpt_dir, "best.pt"))
+                        }
+                        if training_mode == "lora":
+                            unet.module.save_lora(os.path.join(ckpt_dir, "best_lora"))
+                        else:
+                            best_payload["unet"] = unet.module.state_dict()
+                        torch.save(best_payload, os.path.join(ckpt_dir, "best.pt"))
                         print(
                             f"  → New best ({val_cfg.get('best_metric', 'val/cosine_sim')}="
                             f"{best_tracker.best_value:.4f})  saved best.pt"

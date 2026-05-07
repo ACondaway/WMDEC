@@ -404,12 +404,16 @@ def train(config: dict, resume_path: str = None):
                     if best_tracker.update(val_metrics, global_step):
                         ckpt_dir = os.path.join(config["training"]["output_dir"], "checkpoints")
                         os.makedirs(ckpt_dir, exist_ok=True)
-                        torch.save({
+                        best_payload = {
                             "step": global_step,
-                            "unet": unet.module.state_dict(),
                             "img_adapter": img_adapter.module.state_dict(),
                             "val_metrics": val_metrics,
-                        }, os.path.join(ckpt_dir, "best.pt"))
+                        }
+                        if training_mode == "lora":
+                            unet.module.save_lora(os.path.join(ckpt_dir, "best_lora"))
+                        else:
+                            best_payload["unet"] = unet.module.state_dict()
+                        torch.save(best_payload, os.path.join(ckpt_dir, "best.pt"))
                         print(
                             f"  → New best ({val_cfg.get('best_metric', 'val/cosine_sim')}="
                             f"{best_tracker.best_value:.4f})  saved best.pt"
