@@ -159,8 +159,17 @@ def train(config: dict, resume_path: str = None):
         if is_main:
             print(f"Resuming from {resume_path}")
         ckpt = torch.load(resume_path, map_location=device)
-        unet.module.load_state_dict(ckpt["unet"])
         img_adapter.module.load_state_dict(ckpt["img_adapter"])
+        if training_mode == "lora":
+            # LoRA weights are saved in a sibling directory lora_step_N/
+            lora_dir = os.path.join(
+                os.path.dirname(resume_path), f"lora_step_{ckpt['step']}"
+            )
+            unet.module.load_lora(lora_dir)
+            if is_main:
+                print(f"  Loaded LoRA adapter from {lora_dir}")
+        else:
+            unet.module.load_state_dict(ckpt["unet"])
         if "optimizer" in ckpt:
             optimizer.load_state_dict(ckpt["optimizer"])
         if "lr_scheduler" in ckpt:
