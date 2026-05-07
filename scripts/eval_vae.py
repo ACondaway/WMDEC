@@ -35,6 +35,7 @@ import math
 import os
 import random
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Optional, Tuple
 
@@ -50,6 +51,7 @@ sys.path.insert(0, str(_ROOT))
 
 from models.vae import VAEWrapper
 from evaluation.metrics import LPIPSMetric, MetricAccumulator, compute_psnr
+from evaluation.visualize import save_comparison_grid
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +146,15 @@ def _all_reduce_int(value: int, device: torch.device) -> int:
 # Core evaluation loop
 # ---------------------------------------------------------------------------
 
+@dataclass
+class VisSample:
+    original: torch.Tensor   # (3, H, W) cpu, [-1, 1]
+    recon:    torch.Tensor   # (3, H, W) cpu, [-1, 1]
+    psnr:     float
+    lpips:    float
+    label:    str
+
+
 @torch.no_grad()
 def evaluate_vae(
     vae: VAEWrapper,
@@ -152,13 +163,19 @@ def evaluate_vae(
     device: torch.device,
     rank: int,
     log_every: int = 10,
-) -> MetricAccumulator:
+    vis_max: int = 0,
+) -> Tuple[MetricAccumulator, List[VisSample]]:
     """
     Run the VAE encode → decode round-trip on every batch and accumulate metrics.
 
-    Returns a MetricAccumulator populated with PSNR and LPIPS per dataset.
+    Args:
+        vis_max: Number of images to collect for visualisation (0 = disabled).
+
+    Returns:
+        (accumulator, vis_samples) — vis_samples is empty when vis_max == 0.
     """
     acc = MetricAccumulator()
+    vis_buf: List[VisSample] = []
     vae.eval()
 
     for batch_idx, batch in enumerate(loader):
@@ -175,12 +192,19 @@ def evaluate_vae(
 
         # Accumulate — group by dataset name
         for i in range(len(images)):
-            acc.update(
-                psnr=psnr_vals[i].item(),
-                lpips_val=lpips_vals[i].item(),
-                n=1,
-                key=ds_names[i],
-            )
+            psnr_i  = psnr_vals[i].item()
+            lpips_i = lpips_vals[i].item()
+            acc.update(psnr=psnr_i, lpips_val=lpips_i, n=1, key=ds_names[i])
+
+            # Collect visualisation samples on rank 0 until the budget is full
+            if rank == 0 and len(vis_buf) < vis_max:
+                vis_buf.append(VisSample(
+                    original=images[i].cpu(),
+                    recon=recon[i].cpu(),
+                    psnr=psnr_i,
+                    lpips=lpips_i,
+                    label=ds_names[i],
+                ))
 
         if rank == 0 and (batch_idx + 1) % log_every == 0:
             print(
@@ -190,7 +214,7 @@ def evaluate_vae(
                 flush=True,
             )
 
-    return acc
+    return acc, vis_buf
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +278,13 @@ def parse_args() -> argparse.Namespace:
                    help="Print progress every N batches.")
     p.add_argument("--output_json", default="vae_eval_results.json",
                    help="Path to write JSON results (rank-0 only).")
+    p.add_argument("--vis_samples", type=int, default=16,
+                   help="Number of image pairs to include in the comparison grid "
+                        "(rank-0 only, 0 = skip visualisation).")
+    p.add_argument("--vis_nrow", type=int, default=4,
+                   help="Number of (original | reconstructed) pairs per grid row.")
+    p.add_argument("--vis_output", default="vae_eval_grid.png",
+                   help="Output path for the comparison grid PNG.")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -339,13 +370,14 @@ def main() -> None:
         print(f"[eval_vae] Running evaluation ...")
 
     # ── Evaluate ────────────────────────────────────────────────────────────
-    local_acc = evaluate_vae(
+    local_acc, vis_buf = evaluate_vae(
         vae=vae,
         lpips_fn=lpips_fn,
         loader=loader,
         device=device,
         rank=rank,
         log_every=args.log_every,
+        vis_max=args.vis_samples if rank == 0 else 0,
     )
 
     # ── Aggregate across ranks ───────────────────────────────────────────────
@@ -372,6 +404,22 @@ def main() -> None:
         with open(out_path, "w") as f:
             json.dump(result_dict, f, indent=2)
         print(f"[eval_vae] Results saved to {out_path}")
+
+        # ── Visualisation ────────────────────────────────────────────────────
+        if vis_buf:
+            save_comparison_grid(
+                originals       =[s.original for s in vis_buf],
+                reconstructions =[s.recon    for s in vis_buf],
+                psnr_values     =[s.psnr     for s in vis_buf],
+                lpips_values    =[s.lpips    for s in vis_buf],
+                labels          =[s.label    for s in vis_buf],
+                output_path     =args.vis_output,
+                nrow            =args.vis_nrow,
+                title           =f"VAE Reconstruction  "
+                                 f"(PSNR={global_acc.mean_psnr:.2f} dB  "
+                                 f"LPIPS={global_acc.mean_lpips:.4f})",
+            )
+            print(f"[eval_vae] Comparison grid saved to {args.vis_output}")
 
     if _is_dist():
         dist.destroy_process_group()
