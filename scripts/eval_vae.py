@@ -175,7 +175,6 @@ def evaluate_vae(
     loader: DataLoader,
     device: torch.device,
     rank: int,
-    log_every: int = 10,
     vis_max: int = 0,
 ) -> Tuple[MetricAccumulator, List[VisSample]]:
     """
@@ -185,11 +184,21 @@ def evaluate_vae(
         (accumulator, vis_samples)
         vis_samples is populated only on rank 0, up to vis_max images.
     """
+    from tqdm import tqdm
+
     acc = MetricAccumulator()
     vis_buf: List[VisSample] = []
     vae.eval()
 
-    for batch_idx, batch in enumerate(loader):
+    pbar = tqdm(
+        loader,
+        desc="VAE eval",
+        unit="batch",
+        disable=(rank != 0),
+        dynamic_ncols=True,
+    )
+
+    for batch in pbar:
         images: torch.Tensor = batch["image"].to(device)   # (B, 3, H, W) in [-1, 1]
         ds_names: List[str]  = batch["dataset_name"]
 
@@ -213,12 +222,11 @@ def evaluate_vae(
                     label=ds_names[i],
                 ))
 
-        if rank == 0 and (batch_idx + 1) % log_every == 0:
-            print(
-                f"  batch {batch_idx+1:4d}/{len(loader)}  "
-                f"PSNR={acc.mean_psnr:.2f} dB  LPIPS={acc.mean_lpips:.4f}  "
-                f"n={acc.count:,}",
-                flush=True,
+        if rank == 0:
+            pbar.set_postfix(
+                PSNR=f"{acc.mean_psnr:.2f}",
+                LPIPS=f"{acc.mean_lpips:.4f}",
+                n=acc.count,
             )
 
     return acc, vis_buf
@@ -314,8 +322,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lpips_net",   default="vgg",
                    choices=["vgg", "alex", "squeeze"],
                    help="LPIPS backbone network.")
-    p.add_argument("--log_every",   type=int, default=10,
-                   help="Print progress every N batches.")
     p.add_argument("--output_json", default="vae_eval_results.json")
     p.add_argument("--vis_samples", type=int, default=16,
                    help="Images to include in the comparison grid (0 = skip).")
@@ -405,7 +411,6 @@ def main() -> None:
         loader=loader,
         device=device,
         rank=rank,
-        log_every=args.log_every,
         vis_max=args.vis_samples if rank == 0 else 0,
     )
 
