@@ -5,26 +5,33 @@ VAE Reconstruction Quality Evaluation
 Measures how well the project's pretrained VAE (encode → decode round-trip)
 preserves image content, using PSNR (↑ better) and LPIPS (↓ better).
 
-This is a pre-training sanity check: if the VAE itself cannot reconstruct
-images faithfully there is a hard upper bound on what the full diffusion
-decoder can achieve.
+Image loading reuses the same preprocessor registry and preprocess_config.yaml
+used by the offline embedding pipeline, so directory-walking logic is never
+duplicated.
 
 Usage
 -----
-    # Evaluate using datasets from config
-    python scripts/eval_vae.py --config configs/base.yaml
+    # Evaluate all datasets declared in preprocess_config.yaml
+    python scripts/eval_vae.py \
+        --config configs/base.yaml \
+        --preprocess_config scripts/preprocess_config.yaml
 
-    # Evaluate a specific image directory instead
-    python scripts/eval_vae.py --config configs/base.yaml \
-        --image_dir /path/to/images --num_samples 500
+    # Cap to 500 random images, save grid
+    python scripts/eval_vae.py \
+        --config configs/base.yaml \
+        --preprocess_config scripts/preprocess_config.yaml \
+        --num_samples 500 --vis_samples 32
 
-    # Multi-GPU (all ranks cooperate, rank-0 prints final summary)
-    torchrun --nproc_per_node=4 scripts/eval_vae.py --config configs/base.yaml
+    # 4-GPU
+    torchrun --nproc_per_node=4 scripts/eval_vae.py \
+        --config configs/base.yaml \
+        --preprocess_config scripts/preprocess_config.yaml
 
 Output
 ------
-    Per-batch progress is printed to stdout.
-    A final JSON summary is saved to --output_json (default: vae_eval_results.json).
+    Per-batch progress printed to stdout.
+    JSON summary  → --output_json  (default: vae_eval_results.json)
+    Comparison grid → --vis_output (default: vae_eval_grid.png)
 """
 
 from __future__ import annotations
@@ -37,80 +44,93 @@ import random
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
-from PIL import Image
 
-# Resolve project root so imports work regardless of cwd
 _ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(_ROOT))
 
 from models.vae import VAEWrapper
 from evaluation.metrics import LPIPSMetric, MetricAccumulator, compute_psnr
 from evaluation.visualize import save_comparison_grid
+from data.preprocessors import PREPROCESSORS
+from data.preprocessors.base import BaseDatasetPreprocessor, SampleMeta
 
 
 # ---------------------------------------------------------------------------
-# Image dataset  (raw images, no embeddings needed)
+# Dataset backed by preprocessors
 # ---------------------------------------------------------------------------
 
-class ImageFolderFlat(Dataset):
+@dataclass
+class _IndexedSample:
+    preprocessor: BaseDatasetPreprocessor
+    sample: SampleMeta
+    ds_name: str
+
+
+class PreprocessorDataset(Dataset):
     """
-    Walks one or more directories recursively and returns all JPEG/PNG images.
+    Map-style Dataset that loads raw images using the same preprocessor
+    registry and load_image() logic as the offline embedding pipeline.
 
     Args:
-        roots:       List of (dataset_name, root_path) tuples.
-        resolution:  Images are resized and centre-cropped to this size.
-        max_samples: Cap on total images (random subset, deterministic seed).
+        preprocessors: list of (dataset_name, preprocessor) pairs.
+        resolution:    images are resized + centre-cropped to this size.
+        max_samples:   optional cap; a random subset is drawn deterministically.
+        seed:          RNG seed for the random subset.
     """
-
-    EXTS = {".jpg", ".jpeg", ".png", ".webp"}
 
     def __init__(
         self,
-        roots: List[Tuple[str, str]],
+        preprocessors: List[Tuple[str, BaseDatasetPreprocessor]],
         resolution: int = 512,
         max_samples: Optional[int] = None,
         seed: int = 42,
     ):
-        self.resolution = resolution
         self.transform = transforms.Compose([
-            transforms.Resize(resolution, interpolation=transforms.InterpolationMode.BICUBIC),
+            transforms.Resize(
+                resolution,
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
             transforms.CenterCrop(resolution),
             transforms.ToTensor(),
             transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # → [-1, 1]
         ])
 
-        # Collect (dataset_name, abs_path) pairs
-        all_samples: List[Tuple[str, str]] = []
-        for ds_name, root in roots:
-            for dirpath, _, fnames in os.walk(root):
-                for fname in fnames:
-                    if Path(fname).suffix.lower() in self.EXTS:
-                        all_samples.append((ds_name, os.path.join(dirpath, fname)))
+        # Collect sample index — just SampleMeta descriptors, no images yet.
+        # iter_samples() is a generator so this is memory-efficient even for
+        # millions of files; we stop early once max_samples is reached.
+        all_samples: List[_IndexedSample] = []
+        for ds_name, prep in preprocessors:
+            for sample in prep.iter_samples():
+                all_samples.append(_IndexedSample(prep, sample, ds_name))
+                # Early exit when we already have enough (avoids walking the
+                # remainder of large datasets when max_samples is small).
+                if max_samples and len(all_samples) >= max_samples * 4:
+                    break   # over-collect then subsample for better coverage
 
         if not all_samples:
-            raise ValueError(f"No images found under: {[r for _, r in roots]}")
+            raise ValueError("No images found via the provided preprocessors.")
 
-        if max_samples and max_samples < len(all_samples):
+        if max_samples and len(all_samples) > max_samples:
             rng = random.Random(seed)
             all_samples = rng.sample(all_samples, max_samples)
 
-        self.samples = all_samples
+        self._samples = all_samples
 
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self._samples)
 
     def __getitem__(self, idx: int) -> dict:
-        ds_name, path = self.samples[idx]
-        img = Image.open(path).convert("RGB")
+        entry = self._samples[idx]
+        img = entry.preprocessor.load_image(entry.sample)
         return {
             "image":        self.transform(img),
-            "dataset_name": ds_name,
+            "dataset_name": entry.ds_name,
         }
 
 
@@ -121,14 +141,11 @@ class ImageFolderFlat(Dataset):
 def _is_dist() -> bool:
     return dist.is_available() and dist.is_initialized()
 
-
 def _world_size() -> int:
     return dist.get_world_size() if _is_dist() else 1
 
-
 def _rank() -> int:
     return dist.get_rank() if _is_dist() else 0
-
 
 def _all_reduce_scalar(value: float, device: torch.device) -> float:
     if not _is_dist():
@@ -136,10 +153,6 @@ def _all_reduce_scalar(value: float, device: torch.device) -> float:
     t = torch.tensor(value, dtype=torch.float64, device=device)
     dist.all_reduce(t, op=dist.ReduceOp.SUM)
     return t.item()
-
-
-def _all_reduce_int(value: int, device: torch.device) -> int:
-    return int(_all_reduce_scalar(float(value), device))
 
 
 # ---------------------------------------------------------------------------
@@ -166,37 +179,31 @@ def evaluate_vae(
     vis_max: int = 0,
 ) -> Tuple[MetricAccumulator, List[VisSample]]:
     """
-    Run the VAE encode → decode round-trip on every batch and accumulate metrics.
-
-    Args:
-        vis_max: Number of images to collect for visualisation (0 = disabled).
+    VAE encode → decode round-trip over all batches.
 
     Returns:
-        (accumulator, vis_samples) — vis_samples is empty when vis_max == 0.
+        (accumulator, vis_samples)
+        vis_samples is populated only on rank 0, up to vis_max images.
     """
     acc = MetricAccumulator()
     vis_buf: List[VisSample] = []
     vae.eval()
 
     for batch_idx, batch in enumerate(loader):
-        images: torch.Tensor = batch["image"].to(device)     # (B, 3, H, W) in [-1, 1]
+        images: torch.Tensor = batch["image"].to(device)   # (B, 3, H, W) in [-1, 1]
         ds_names: List[str]  = batch["dataset_name"]
 
-        # VAE round-trip
         latents = vae.encode(images)
-        recon   = vae.decode(latents)                         # (B, 3, H, W) in [-1, 1]
+        recon   = vae.decode(latents)                       # (B, 3, H, W) in [-1, 1]
 
-        # Per-image metrics
-        psnr_vals  = compute_psnr(recon, images)             # (B,)
-        lpips_vals = lpips_fn(recon, images)                 # (B,)
+        psnr_vals  = compute_psnr(recon, images)            # (B,)
+        lpips_vals = lpips_fn(recon, images)                # (B,)
 
-        # Accumulate — group by dataset name
         for i in range(len(images)):
             psnr_i  = psnr_vals[i].item()
             lpips_i = lpips_vals[i].item()
             acc.update(psnr=psnr_i, lpips_val=lpips_i, n=1, key=ds_names[i])
 
-            # Collect visualisation samples on rank 0 until the budget is full
             if rank == 0 and len(vis_buf) < vis_max:
                 vis_buf.append(VisSample(
                     original=images[i].cpu(),
@@ -218,57 +225,86 @@ def evaluate_vae(
 
 
 # ---------------------------------------------------------------------------
-# Distributed aggregation of MetricAccumulator
+# Distributed accumulator merge
 # ---------------------------------------------------------------------------
 
 def _gather_accumulator(local: MetricAccumulator, device: torch.device) -> MetricAccumulator:
-    """
-    Merge per-rank MetricAccumulators into one global accumulator on rank 0.
-    All ranks must call this simultaneously.
-    """
+    """Merge per-rank accumulators into one on rank 0. All ranks must call."""
     all_dicts: List[Optional[dict]] = [None] * _world_size()
     dist.all_gather_object(all_dicts, local.to_dict())
 
     if _rank() != 0:
-        return local  # non-zero ranks don't need the merged result
+        return local
 
     merged = MetricAccumulator()
-    for rank_dict in all_dicts:
-        # Reconstruct a dummy accumulator from the serialised dict
-        n = rank_dict["n_images"]
+    for d in all_dicts:
+        n = d["n_images"]
         if n == 0:
             continue
-        merged.update(rank_dict["psnr_db"], rank_dict["lpips"], n=n)
-        for ds_name, ds_dict in rank_dict.get("per_dataset", {}).items():
-            ds_n = ds_dict["n_images"]
+        merged.update(d["psnr_db"], d["lpips"], n=n)
+        for ds_name, ds_d in d.get("per_dataset", {}).items():
+            ds_n = ds_d["n_images"]
             if ds_n > 0:
-                merged.update(ds_dict["psnr_db"], ds_dict["lpips"], n=ds_n, key=ds_name)
+                merged.update(ds_d["psnr_db"], ds_d["lpips"], n=ds_n, key=ds_name)
     return merged
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Preprocessor instantiation from preprocess_config.yaml
+# ---------------------------------------------------------------------------
+
+def _build_preprocessors(
+    preprocess_cfg: dict,
+) -> List[Tuple[str, BaseDatasetPreprocessor]]:
+    """
+    Instantiate preprocessors from the preprocess_config.yaml structure.
+
+    Each dataset entry needs:
+        name      — used as dataset_name and output subdir
+        image_dir — passed as image_root
+        type      — registry key in PREPROCESSORS (defaults to name if omitted)
+
+    output_root is set to a scratch path since eval never writes embeddings.
+    """
+    result = []
+    dummy_output = "/tmp/_eval_vae_dummy"
+    for ds in preprocess_cfg["datasets"]:
+        ds_name   = ds["name"]
+        image_dir = ds["image_dir"]
+        ds_type   = ds.get("type", ds_name)   # type defaults to name
+
+        if ds_type not in PREPROCESSORS:
+            raise ValueError(
+                f"Unknown preprocessor type '{ds_type}' for dataset '{ds_name}'. "
+                f"Registered types: {list(PREPROCESSORS)}"
+            )
+
+        prep = PREPROCESSORS[ds_type](
+            image_root=image_dir,
+            output_root=dummy_output,
+        )
+        result.append((ds_name, prep))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# CLI
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Evaluate VAE reconstruction quality (PSNR + LPIPS)."
+        description="Evaluate VAE reconstruction quality (PSNR + LPIPS).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    p.add_argument("--config", required=True, help="Path to configs/base.yaml")
-    p.add_argument(
-        "--image_dir", default=None,
-        help="Override: evaluate a single flat image directory instead of config datasets.",
-    )
-    p.add_argument(
-        "--dataset_name", default="custom",
-        help="Dataset name used when --image_dir is specified.",
-    )
-    p.add_argument(
-        "--num_samples", type=int, default=None,
-        help="Max number of images to evaluate (random subset).  Default: all.",
-    )
+    p.add_argument("--config", required=True,
+                   help="Path to configs/base.yaml (provides VAE model name + resolution).")
+    p.add_argument("--preprocess_config",
+                   default="scripts/preprocess_config.yaml",
+                   help="Path to preprocess_config.yaml (provides dataset type + image_dir).")
+    p.add_argument("--num_samples", type=int, default=None,
+                   help="Max images to evaluate (random subset). Default: all.")
     p.add_argument("--resolution",  type=int, default=None,
-                   help="Override resolution (default: from config).")
+                   help="Override image resolution (default: from base.yaml).")
     p.add_argument("--batch_size",  type=int, default=16)
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--lpips_net",   default="vgg",
@@ -276,70 +312,59 @@ def parse_args() -> argparse.Namespace:
                    help="LPIPS backbone network.")
     p.add_argument("--log_every",   type=int, default=10,
                    help="Print progress every N batches.")
-    p.add_argument("--output_json", default="vae_eval_results.json",
-                   help="Path to write JSON results (rank-0 only).")
+    p.add_argument("--output_json", default="vae_eval_results.json")
     p.add_argument("--vis_samples", type=int, default=16,
-                   help="Number of image pairs to include in the comparison grid "
-                        "(rank-0 only, 0 = skip visualisation).")
-    p.add_argument("--vis_nrow", type=int, default=4,
-                   help="Number of (original | reconstructed) pairs per grid row.")
-    p.add_argument("--vis_output", default="vae_eval_grid.png",
-                   help="Output path for the comparison grid PNG.")
-    p.add_argument("--seed", type=int, default=42)
+                   help="Images to include in the comparison grid (0 = skip).")
+    p.add_argument("--vis_nrow",    type=int, default=4,
+                   help="(original | reconstructed) pairs per grid row.")
+    p.add_argument("--vis_output",  default="vae_eval_grid.png")
+    p.add_argument("--seed",        type=int, default=42)
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
 
-    # ── Distributed init ────────────────────────────────────────────────────
+    # ── Distributed init ─────────────────────────────────────────────────────
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     if "LOCAL_RANK" in os.environ:
         dist.init_process_group(backend="nccl")
         torch.cuda.set_device(local_rank)
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
-    rank   = _rank()
-    world  = _world_size()
+    rank  = _rank()
+    world = _world_size()
 
-    # ── Config ──────────────────────────────────────────────────────────────
+    # ── Configs ──────────────────────────────────────────────────────────────
     import yaml
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    with open(args.preprocess_config) as f:
+        preprocess_cfg = yaml.safe_load(f)
 
     resolution = args.resolution or config["data"]["resolution"]
 
-    # ── Dataset ─────────────────────────────────────────────────────────────
-    if args.image_dir:
-        roots = [(args.dataset_name, args.image_dir)]
-    else:
-        # Pull image_dirs from the config datasets section
-        roots = [
-            (ds["name"], ds["image_dir"])
-            for ds in config["data"]["datasets"]
-            if "image_dir" in ds
-        ]
-        if not roots:
-            raise ValueError(
-                "No image_dir entries found in config datasets. "
-                "Specify --image_dir explicitly."
-            )
+    # ── Preprocessors → dataset ──────────────────────────────────────────────
+    preprocessors = _build_preprocessors(preprocess_cfg)
+    ds_names = [n for n, _ in preprocessors]
 
     if rank == 0:
-        print(f"[eval_vae] resolution={resolution}  datasets={[r[0] for r in roots]}")
+        print(
+            f"[eval_vae] resolution={resolution}  "
+            f"datasets={ds_names}  "
+            f"num_samples={args.num_samples or 'all'}"
+        )
 
-    dataset = ImageFolderFlat(
-        roots=roots,
+    dataset = PreprocessorDataset(
+        preprocessors=preprocessors,
         resolution=resolution,
         max_samples=args.num_samples,
         seed=args.seed,
     )
 
-    # Each rank evaluates a disjoint slice
+    # Shard across ranks — simple index interleaving, no sampler needed
     if world > 1:
-        # Simple index-based shard (no sampler needed — evaluation is deterministic)
-        indices = list(range(rank, len(dataset), world))
         from torch.utils.data import Subset
-        dataset = Subset(dataset, indices)
+        dataset = Subset(dataset, list(range(rank, len(dataset), world)))
 
     loader = DataLoader(
         dataset,
@@ -353,12 +378,12 @@ def main() -> None:
     if rank == 0:
         total = len(dataset) * world if world > 1 else len(dataset)
         print(
-            f"[eval_vae] {total:,} images total  "
-            f"(~{math.ceil(total/world):,}/rank)  "
+            f"[eval_vae] {total:,} images  "
+            f"(~{math.ceil(total / world):,}/rank)  "
             f"batch={args.batch_size}  gpus={world}"
         )
 
-    # ── Models ──────────────────────────────────────────────────────────────
+    # ── Models ───────────────────────────────────────────────────────────────
     unet_name = config["model"]["unet_name"]
     if rank == 0:
         print(f"[eval_vae] Loading VAE from {unet_name} ...")
@@ -367,9 +392,9 @@ def main() -> None:
     lpips_fn = LPIPSMetric(net=args.lpips_net, device=device)
 
     if rank == 0:
-        print(f"[eval_vae] Running evaluation ...")
+        print("[eval_vae] Running evaluation ...")
 
-    # ── Evaluate ────────────────────────────────────────────────────────────
+    # ── Evaluate ─────────────────────────────────────────────────────────────
     local_acc, vis_buf = evaluate_vae(
         vae=vae,
         lpips_fn=lpips_fn,
@@ -380,13 +405,10 @@ def main() -> None:
         vis_max=args.vis_samples if rank == 0 else 0,
     )
 
-    # ── Aggregate across ranks ───────────────────────────────────────────────
-    if world > 1:
-        global_acc = _gather_accumulator(local_acc, device)
-    else:
-        global_acc = local_acc
+    # ── Aggregate ────────────────────────────────────────────────────────────
+    global_acc = _gather_accumulator(local_acc, device) if world > 1 else local_acc
 
-    # ── Report (rank 0 only) ─────────────────────────────────────────────────
+    # ── Report (rank 0) ───────────────────────────────────────────────────────
     if rank == 0:
         print("\n" + "─" * 60)
         print("[eval_vae] Results:")
@@ -394,10 +416,13 @@ def main() -> None:
         print("─" * 60)
 
         result_dict = global_acc.to_dict()
-        result_dict["config"]     = args.config
-        result_dict["resolution"] = resolution
-        result_dict["lpips_net"]  = args.lpips_net
-        result_dict["backbone"]   = config["model"].get("backbone", "unknown")
+        result_dict.update({
+            "config":           args.config,
+            "preprocess_config": args.preprocess_config,
+            "resolution":       resolution,
+            "lpips_net":        args.lpips_net,
+            "backbone":         config["model"].get("backbone", "unknown"),
+        })
 
         out_path = Path(args.output_json)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -405,7 +430,6 @@ def main() -> None:
             json.dump(result_dict, f, indent=2)
         print(f"[eval_vae] Results saved to {out_path}")
 
-        # ── Visualisation ────────────────────────────────────────────────────
         if vis_buf:
             save_comparison_grid(
                 originals       =[s.original for s in vis_buf],
@@ -415,9 +439,11 @@ def main() -> None:
                 labels          =[s.label    for s in vis_buf],
                 output_path     =args.vis_output,
                 nrow            =args.vis_nrow,
-                title           =f"VAE Reconstruction  "
-                                 f"(PSNR={global_acc.mean_psnr:.2f} dB  "
-                                 f"LPIPS={global_acc.mean_lpips:.4f})",
+                title           =(
+                    f"VAE Reconstruction  "
+                    f"(PSNR={global_acc.mean_psnr:.2f} dB  "
+                    f"LPIPS={global_acc.mean_lpips:.4f})"
+                ),
             )
             print(f"[eval_vae] Comparison grid saved to {args.vis_output}")
 
