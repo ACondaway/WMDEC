@@ -279,10 +279,14 @@ def _build_preprocessors(
                 f"Registered types: {list(PREPROCESSORS)}"
             )
 
-        prep = PREPROCESSORS[ds_type](
-            image_root=image_dir,
-            output_root=dummy_output,
-        )
+        import inspect
+        sig = inspect.signature(PREPROCESSORS[ds_type].__init__)
+        kwargs: dict = {"image_root": image_dir, "output_root": dummy_output}
+        if "name" in sig.parameters:
+            kwargs["name"] = ds_name
+        if "camera_key" in sig.parameters and "camera_key" in ds:
+            kwargs["camera_key"] = ds["camera_key"]
+        prep = PREPROCESSORS[ds_type](**kwargs)
         result.append((ds_name, prep))
     return result
 
