@@ -46,22 +46,36 @@ from typing import List, Union
 # the schema check runs.  Applied once at import time; no-op if already resolved.
 def _patch_infer_schema_for_string_annotations() -> None:
     import typing
-    try:
-        import torch._library.infer_schema as _mod
-        _orig = _mod.infer_schema
 
-        def _patched(func, mutates_args=(), op_name=None):
+    def _make_patched(orig):
+        import inspect
+        sig = inspect.signature(orig)
+
+        def _patched(func, *args, **kwargs):
             try:
                 resolved = typing.get_type_hints(func)
                 if resolved != func.__annotations__:
                     func.__annotations__ = resolved
             except Exception:
                 pass  # resolution failed — let the original raise if it must
-            return _orig(func, mutates_args=mutates_args, op_name=op_name)
+            return orig(func, *args, **kwargs)
 
-        _mod.infer_schema = _patched
-    except Exception:
-        pass  # torch version without this module — nothing to patch
+        return _patched
+
+    # Patch every known location where infer_schema lives across torch versions
+    _targets = [
+        ("torch._library.infer_schema",  "infer_schema"),
+        ("torch._custom_op.impl",        "infer_schema"),
+    ]
+    for mod_name, attr in _targets:
+        try:
+            import importlib
+            mod = importlib.import_module(mod_name)
+            orig = getattr(mod, attr, None)
+            if orig is not None and callable(orig):
+                setattr(mod, attr, _make_patched(orig))
+        except Exception:
+            pass
 
 _patch_infer_schema_for_string_annotations()
 
