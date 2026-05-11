@@ -183,9 +183,19 @@ def train(config: dict, resume_path: str = None):
         del ckpt
 
     # ---- Step 3: torch.compile() — AFTER weight load, BEFORE DDP ----
-    if is_main:
-        print(f"Compiling UNet (mode='{compile_mode}') ...")
-    unet = torch.compile(raw_unet, mode=compile_mode)
+    # LoRA mode: PEFT injects custom ops whose string-annotated type hints
+    # (e.g. 'torch.Tensor') cause torch.compile's infer_schema to crash.
+    # Skipping UNet compilation in LoRA mode is safe — the LoRA deltas are
+    # < 1 % of parameters and the compile speedup on the frozen backbone is
+    # inaccessible once PEFT has replaced its linear layers.
+    if training_mode == "lora":
+        unet = raw_unet
+        if is_main:
+            print("LoRA mode: skipping UNet torch.compile (PEFT custom-op incompatibility).")
+    else:
+        if is_main:
+            print(f"Compiling UNet (mode='{compile_mode}') ...")
+        unet = torch.compile(raw_unet, mode=compile_mode)
 
     if compile_adapter:
         if is_main:
