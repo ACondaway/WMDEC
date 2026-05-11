@@ -33,6 +33,38 @@ import torch.nn as nn
 from PIL import Image
 from typing import List, Union
 
+# ---------------------------------------------------------------------------
+# Compatibility patch: Qwen3.5 custom op registration vs PyTorch >= 2.3
+# ---------------------------------------------------------------------------
+# Qwen3.5's transformers code uses `from __future__ import annotations` which
+# turns all type hints into strings at runtime, e.g. 'torch.Tensor' instead of
+# torch.Tensor.  PyTorch >= 2.3 infer_schema reads func.__annotations__ directly
+# and raises ValueError when it sees string annotations instead of type objects.
+#
+# Fix: wrap infer_schema to resolve string annotations with typing.get_type_hints()
+# (which evaluates the strings in the function's own __globals__ context) before
+# the schema check runs.  Applied once at import time; no-op if already resolved.
+def _patch_infer_schema_for_string_annotations() -> None:
+    import typing
+    try:
+        import torch._library.infer_schema as _mod
+        _orig = _mod.infer_schema
+
+        def _patched(func, mutates_args=(), op_name=None):
+            try:
+                resolved = typing.get_type_hints(func)
+                if resolved != func.__annotations__:
+                    func.__annotations__ = resolved
+            except Exception:
+                pass  # resolution failed — let the original raise if it must
+            return _orig(func, mutates_args=mutates_args, op_name=op_name)
+
+        _mod.infer_schema = _patched
+    except Exception:
+        pass  # torch version without this module — nothing to patch
+
+_patch_infer_schema_for_string_annotations()
+
 # Fixed output shape contract:
 #   input  : 448×448 RGB image
 #   output : (196, 2560) patch features
