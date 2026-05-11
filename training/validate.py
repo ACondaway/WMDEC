@@ -109,6 +109,7 @@ def run_fast_validation(
     n_vis: int = 4,
     backbone: str = "sdxl",
     resolution: int = 512,
+    training_mode: str = "full",
 ) -> dict:
     """
     Compute diffusion loss and cosine similarity over the val set.
@@ -131,10 +132,13 @@ def run_fast_validation(
 
     for batch in val_loader:
         z_img_emb = batch["z_img"].to(device)   # (B, N_patches, D)
-        images = batch["image"].to(device)        # (B, 3, H, W)
-        B = images.shape[0]
+        B = z_img_emb.shape[0]
 
-        latent = vae.encode(images)
+        # Use pre-computed latent if available; otherwise encode image on-the-fly
+        if "z_vae" in batch:
+            latent = batch["z_vae"].to(device)
+        else:
+            latent = vae.encode(batch["image"].to(device))
 
         # No condition dropout during validation.
         tokens, pooled = img_adapter(z_img_emb)
@@ -146,6 +150,8 @@ def run_fast_validation(
         # Backbone-dependent target and UNet call.
         if backbone == "sd21":
             target = scheduler.get_v_target(latent, noise, t)
+            # In frozen mode, tokens go to UNetImageConditioner (handled inside LDMUNet.forward).
+            # In other modes, tokens also go through the same interface.
             pred = unet(x_t, t, tokens)
         else:
             target = noise
@@ -180,7 +186,10 @@ def run_fast_validation(
         # Save GT vs x0 reconstruction from the first val batch.
         if not vis_saved and output_dir is not None and x0_pred is not None:
             _n = min(n_vis, B)
-            gt_vis   = (images[:_n] * 0.5 + 0.5).clamp(0, 1).cpu()
+            if "image" in batch:
+                gt_vis = (batch["image"][:_n].to(device) * 0.5 + 0.5).clamp(0, 1).cpu()
+            else:
+                gt_vis = (vae.decode(latent[:_n]) * 0.5 + 0.5).clamp(0, 1).cpu()
             pred_vis = (vae.decode(x0_pred[:_n]) * 0.5 + 0.5).clamp(0, 1).cpu()
             grid = make_grid(torch.cat([gt_vis, pred_vis], dim=0), nrow=_n)
             val_vis_dir = os.path.join(output_dir, "val_visualizations")
@@ -226,6 +235,7 @@ def run_full_validation(
     backbone: str = "sdxl",
     model_name: str = None,
     resolution: int = 512,
+    training_mode: str = "full",
 ) -> dict:
     """
     Generate images with DDIM and compute LPIPS.
@@ -272,17 +282,27 @@ def run_full_validation(
             break
 
         z_img_emb = batch["z_img"].to(device)
-        images = batch["image"].to(device)
-        B = images.shape[0]
+        B = z_img_emb.shape[0]
+
+        # Ground-truth images for LPIPS comparison
+        if "image" in batch:
+            images = batch["image"].to(device)
+        else:
+            images = None
 
         tokens, pooled = img_adapter(z_img_emb)
 
         # Build unconditional context for CFG.
-        pooled_dim = pooled.shape[1] if pooled is not None else 0
-        uncond_tokens, uncond_pooled = build_uncond_context(
-            B, tokens.shape[1], tokens.shape[2], device,
-            pooled_proj_dim=pooled_dim,
-        )
+        if backbone == "sd21" and training_mode == "frozen":
+            # Use learnable null_image_tokens as uncond for image-CFG.
+            uncond_tokens = img_adapter.null_image_tokens.expand(B, -1, -1).to(device)
+            uncond_pooled = None
+        else:
+            pooled_dim = pooled.shape[1] if pooled is not None else 0
+            uncond_tokens, uncond_pooled = build_uncond_context(
+                B, tokens.shape[1], tokens.shape[2], device,
+                pooled_proj_dim=pooled_dim,
+            )
 
         latent_h = latent_w = resolution // 8
 
@@ -296,7 +316,7 @@ def run_full_validation(
                     pred_uncond = unet(x, t_batch, uncond_tokens)
                 else:
                     _time_ids = _make_time_ids(B, resolution, device)
-                    pred_cond   = unet(x, t_batch, tokens,       pooled,       _time_ids)
+                    pred_cond   = unet(x, t_batch, tokens,        pooled,       _time_ids)
                     pred_uncond = unet(x, t_batch, uncond_tokens, uncond_pooled, _time_ids)
                 pred = pred_uncond + cfg_scale * (pred_cond - pred_uncond)
             else:
@@ -309,30 +329,33 @@ def run_full_validation(
 
         pred_images = vae.decode(x)                             # (B, 3, H, W) in [-1, 1]
         pred_01 = (pred_images * 0.5 + 0.5).clamp(0, 1)
-        gt_01   = (images       * 0.5 + 0.5).clamp(0, 1)
 
-        all_gt.append(gt_01.cpu())
         all_pred.append(pred_01.cpu())
 
-        if lpips_fn is not None:
-            # LPIPS expects [-1, 1].
-            lp = lpips_fn(pred_images.clamp(-1, 1), images.clamp(-1, 1)).mean().item()
-            total_lpips += lp
+        if images is not None:
+            gt_01 = (images * 0.5 + 0.5).clamp(0, 1)
+            all_gt.append(gt_01.cpu())
+            if lpips_fn is not None:
+                lp = lpips_fn(pred_images.clamp(-1, 1), images.clamp(-1, 1)).mean().item()
+                total_lpips += lp
 
         n_batches += 1
 
     img_adapter.train()
     unet.train()
 
-    # Save comparison grid.
-    if all_gt:
-        gt_cat   = torch.cat(all_gt,   dim=0)
+    # Save comparison grid (GT | reconstruction, or just reconstruction if no images).
+    if all_pred:
         pred_cat = torch.cat(all_pred, dim=0)
-        n_show   = min(8, gt_cat.shape[0])
-        grid = make_grid(
-            torch.cat([gt_cat[:n_show], pred_cat[:n_show]], dim=0),
-            nrow=n_show,
-        )
+        n_show   = min(8, pred_cat.shape[0])
+        if all_gt:
+            gt_cat = torch.cat(all_gt, dim=0)
+            grid = make_grid(
+                torch.cat([gt_cat[:n_show], pred_cat[:n_show]], dim=0),
+                nrow=n_show,
+            )
+        else:
+            grid = make_grid(pred_cat[:n_show], nrow=n_show)
         vis_dir = os.path.join(output_dir, "val_visualizations", "full")
         os.makedirs(vis_dir, exist_ok=True)
         save_image(grid, os.path.join(vis_dir, f"step_{global_step}.png"))

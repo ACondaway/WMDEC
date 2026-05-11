@@ -32,6 +32,32 @@ def apply_condition_dropout(
     return tokens, pooled
 
 
+def apply_image_dropout(
+    image_tokens: torch.Tensor,
+    null_tokens: torch.Tensor,
+    p_drop: float = 0.15,
+) -> torch.Tensor:
+    """
+    Replace image_tokens with null_tokens for a random p_drop fraction of the batch.
+
+    Used during training to enable image-CFG at inference time:
+    the model learns both conditioned and unconditioned generation.
+
+    Args:
+        image_tokens: (B, N, D)
+        null_tokens:  (1, N, D)  learnable null, from img_adapter.null_image_tokens
+        p_drop:       fraction of batch items to replace (default 15%)
+
+    Returns:
+        (B, N, D) with p_drop fraction replaced by null_tokens
+    """
+    B = image_tokens.shape[0]
+    mask = torch.rand(B, device=image_tokens.device) < p_drop
+    tokens = image_tokens.clone()
+    tokens[mask] = null_tokens.expand(B, -1, -1)[mask]
+    return tokens
+
+
 def build_uncond_context(
     batch_size: int,
     num_tokens: int,

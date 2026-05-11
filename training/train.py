@@ -20,10 +20,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from models.adapter import ImageAdapter
 from models.unet import build_unet
 from models.vae import VAEWrapper
-from models.qwen_visual_encoder import QwenVisualEncoder
 from diffusion.scheduler import DDPMScheduler
 from training.loss import DiffusionLoss
-from training.cfg import apply_condition_dropout, build_uncond_context
+from training.cfg import apply_condition_dropout, apply_image_dropout, build_uncond_context
 from training.validate import (
     build_val_loader, run_fast_validation, run_full_validation, BestCheckpointTracker,
 )
@@ -108,6 +107,8 @@ def train(config: dict, resume_path: str = None):
         num_tokens=config["model"]["num_img_tokens"],
         num_heads=config["model"]["num_heads"],
         backbone=backbone,
+        num_pooler_layers=config["model"].get("num_pooler_layers", 2),
+        pooler_self_attn=config["model"].get("pooler_self_attn", False),
     ).to(device)
 
     unet = build_unet(
@@ -115,16 +116,11 @@ def train(config: dict, resume_path: str = None):
         gradient_checkpointing=config["training"].get("gradient_checkpointing", True),
     ).to(device)
 
+    # VAE is kept for visualization / full validation decoding only.
+    # Training uses pre-computed z_vae latents loaded from .pt files.
     vae = VAEWrapper(config["model"]["unet_name"]).to(device)
 
-    qwen_enc = None
-    if config["training"]["lambda_sem"] > 0:
-        qwen_enc = QwenVisualEncoder.from_standalone(
-            config["model"]["qwen_encoder_ckpt"]
-        ).to(device)
-        qwen_enc.eval()
-
-    # ---- Training mode: full fine-tune or LoRA ----
+    # ---- Training mode: full fine-tune, LoRA, or frozen (gated image cross-attn) ----
     training_mode = config["training"].get("training_mode", "full")
     if training_mode == "lora":
         unet.setup_lora(
@@ -132,6 +128,9 @@ def train(config: dict, resume_path: str = None):
             alpha=config["training"].get("lora_alpha", 64),
             target_modules=config["training"].get("lora_target_modules", None),
         )
+    elif training_mode == "frozen":
+        # Freeze base UNet + text encoder; only train ImageAdapter + conditioner (gated layers).
+        unet.freeze_base()
 
     img_adapter = DDP(img_adapter, device_ids=[local_rank], find_unused_parameters=False)
     unet = DDP(unet, device_ids=[local_rank], find_unused_parameters=False)
@@ -141,9 +140,13 @@ def train(config: dict, resume_path: str = None):
     criterion = DiffusionLoss(lambda_sem=config["training"]["lambda_sem"])
 
     # ---- Optimizer ----
-    # Full mode: train all UNet + adapter weights.
-    # LoRA mode: only LoRA delta weights + adapter (base UNet is frozen).
-    params = list(img_adapter.parameters()) + [p for p in unet.parameters() if p.requires_grad]
+    # Full mode:   all UNet + adapter weights.
+    # LoRA mode:   LoRA deltas + adapter (base UNet frozen).
+    # Frozen mode: ImageAdapter + conditioner (gated layers + gates); base UNet frozen.
+    if training_mode == "frozen" and backbone == "sd21":
+        params = list(img_adapter.parameters()) + list(unet.module.conditioner.parameters())
+    else:
+        params = list(img_adapter.parameters()) + [p for p in unet.parameters() if p.requires_grad]
     optimizer = torch.optim.AdamW(
         params, lr=config["training"]["lr"], weight_decay=config["training"]["weight_decay"]
     )
@@ -168,6 +171,12 @@ def train(config: dict, resume_path: str = None):
             unet.module.load_lora(lora_dir)
             if is_main:
                 print(f"  Loaded LoRA adapter from {lora_dir}")
+        elif training_mode == "frozen":
+            # Only conditioner state is saved; base UNet stays frozen
+            if "conditioner" in ckpt:
+                unet.module.conditioner.load_state_dict(ckpt["conditioner"])
+                if is_main:
+                    print("  Loaded conditioner state")
         else:
             unet.module.load_state_dict(ckpt["unet"])
         if "optimizer" in ckpt:
@@ -251,20 +260,31 @@ def train(config: dict, resume_path: str = None):
                 break
 
             z_img_emb = batch["z_img"].to(device)   # (B, N_patches, D)
-            images = batch["image"].to(device)        # (B, 3, H, W)
-            B = images.shape[0]
+            B = z_img_emb.shape[0]
 
             emb_noise_std = config["training"].get("embedding_noise_std", 0.0)
             if emb_noise_std > 0.0:
                 z_img_emb = z_img_emb + torch.randn_like(z_img_emb) * emb_noise_std
 
-            with torch.no_grad():
-                latent = vae.encode(images)
+            # Use pre-computed VAE latent if available; otherwise encode on-the-fly.
+            if "z_vae" in batch:
+                latent = batch["z_vae"].to(device)  # (B, 4, H/8, W/8)
+            else:
+                with torch.no_grad():
+                    latent = vae.encode(batch["image"].to(device))
 
             tokens, pooled = img_adapter(z_img_emb)
-            tokens, pooled = apply_condition_dropout(
-                tokens, pooled, p_drop=config["training"]["cfg_drop_prob"]
-            )
+            if training_mode == "frozen" and backbone == "sd21":
+                # Image CFG dropout: replace tokens with learnable null_image_tokens
+                tokens = apply_image_dropout(
+                    tokens,
+                    img_adapter.module.null_image_tokens,
+                    p_drop=config["training"].get("image_dropout_prob", 0.15),
+                )
+            else:
+                tokens, pooled = apply_condition_dropout(
+                    tokens, pooled, p_drop=config["training"]["cfg_drop_prob"]
+                )
 
             noise = torch.randn_like(latent)
             t = scheduler.sample_timesteps(B, device)
@@ -283,28 +303,6 @@ def train(config: dict, resume_path: str = None):
                     pred = unet(x_t, t, tokens, pooled, time_ids)
                 losses = criterion(pred, target)
 
-            sem_every = config["training"].get("sem_loss_every", 10)
-            if qwen_enc is not None and global_step % sem_every == 0:
-                with torch.no_grad():
-                    if backbone == "sd21":
-                        x_0_pred = scheduler.predict_x0_from_v(pred.detach(), x_t, t)
-                    else:
-                        x_0_pred = scheduler.predict_x0_from_eps(pred.detach(), x_t, t)
-                    x_0_pred = torch.clamp(x_0_pred, -1, 1)
-                    img_pred = vae.decode(x_0_pred)
-                    img_pred_448 = torch.nn.functional.interpolate(
-                        img_pred, size=(448, 448), mode="bilinear", align_corners=False
-                    )
-                    pil_list = [
-                        to_pil_image(((img_pred_448[i] + 1) / 2).clamp(0, 1).cpu())
-                        for i in range(B)
-                    ]
-                    patch_pred = qwen_enc.encode_images(pil_list, device=device)
-
-                sem_loss = criterion.semantic_loss(patch_pred, z_img_emb)
-                losses["semantic"] = sem_loss
-                losses["total"] = losses["total"] + config["training"]["lambda_sem"] * sem_loss
-
             optimizer.zero_grad()
             scaler.scale(losses["total"]).backward()
             scaler.unscale_(optimizer)
@@ -316,21 +314,16 @@ def train(config: dict, resume_path: str = None):
             global_step += 1
 
             if is_main:
-                postfix = {
+                pbar.set_postfix({
                     "loss": f"{losses['total'].item():.4f}",
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                     "epoch": f"{epoch}",
-                }
-                if "semantic" in losses:
-                    postfix["sem"] = f"{losses['semantic'].item():.4f}"
-                pbar.set_postfix(postfix)
+                })
                 pbar.update(1)
 
                 if global_step % config["training"]["log_every"] == 0:
                     loss_history["total"].append((global_step, losses["total"].item()))
                     loss_history["diffusion"].append((global_step, losses["diffusion"].item()))
-                    if "semantic" in losses:
-                        loss_history["semantic"].append((global_step, losses["semantic"].item()))
 
                 if global_step % config["training"]["plot_every"] == 0:
                     save_loss_plot(loss_history, os.path.join(config["training"]["output_dir"], "plots"))
@@ -344,7 +337,11 @@ def train(config: dict, resume_path: str = None):
                     _unet.eval()
                     with torch.no_grad():
                         vis_n = min(4, B)
-                        gt = (images[:vis_n] * 0.5 + 0.5).clamp(0, 1).cpu()
+                        # GT: decode the pre-computed latent if images weren't loaded
+                        if "image" in batch:
+                            gt = (batch["image"][:vis_n] * 0.5 + 0.5).clamp(0, 1).cpu()
+                        else:
+                            gt = (vae.decode(latent[:vis_n]) * 0.5 + 0.5).clamp(0, 1).cpu()
 
                         vis_tokens, vis_pooled = _adapter(z_img_emb[:vis_n])
 
@@ -381,15 +378,16 @@ def train(config: dict, resume_path: str = None):
                         img_adapter=img_adapter.module,
                         unet=unet.module,
                         vae=vae,
-                        qwen_enc=qwen_enc,
+                        qwen_enc=None,
                         scheduler=scheduler,
                         val_loader=val_loader,
                         device=device,
-                        lambda_sem=config["training"]["lambda_sem"],
+                        lambda_sem=0.0,
                         output_dir=config["training"]["output_dir"],
                         global_step=global_step,
                         backbone=backbone,
                         resolution=resolution,
+                        training_mode=training_mode,
                     )
                     loss_history["val/loss_diffusion"].append((global_step, val_metrics["val/loss_diffusion"]))
                     loss_history["val/cosine_sim"].append((global_step, val_metrics["val/cosine_sim"]))
@@ -411,6 +409,8 @@ def train(config: dict, resume_path: str = None):
                         }
                         if training_mode == "lora":
                             unet.module.save_lora(os.path.join(ckpt_dir, "best_lora"))
+                        elif training_mode == "frozen":
+                            best_payload["conditioner"] = unet.module.conditioner.state_dict()
                         else:
                             best_payload["unet"] = unet.module.state_dict()
                         torch.save(best_payload, os.path.join(ckpt_dir, "best.pt"))
@@ -434,6 +434,7 @@ def train(config: dict, resume_path: str = None):
                         backbone=backbone,
                         model_name=config["model"]["unet_name"],
                         resolution=resolution,
+                        training_mode=training_mode,
                     )
                     if full_metrics["val/lpips"] >= 0:
                         loss_history["val/lpips"].append((global_step, full_metrics["val/lpips"]))
@@ -454,6 +455,8 @@ def train(config: dict, resume_path: str = None):
                 if training_mode == "lora":
                     lora_dir = os.path.join(ckpt_dir, f"lora_step_{global_step}")
                     unet.module.save_lora(lora_dir)
+                elif training_mode == "frozen":
+                    ckpt_payload["conditioner"] = unet.module.conditioner.state_dict()
                 else:
                     ckpt_payload["unet"] = unet.module.state_dict()
                 torch.save(ckpt_payload, os.path.join(ckpt_dir, f"step_{global_step}.pt"))
@@ -466,6 +469,12 @@ def train(config: dict, resume_path: str = None):
             torch.save({
                 "step": global_step,
                 "img_adapter": img_adapter.module.state_dict(),
+            }, os.path.join(config["training"]["output_dir"], "final.pt"))
+        elif training_mode == "frozen":
+            torch.save({
+                "step": global_step,
+                "img_adapter": img_adapter.module.state_dict(),
+                "conditioner": unet.module.conditioner.state_dict(),
             }, os.path.join(config["training"]["output_dir"], "final.pt"))
         else:
             torch.save({

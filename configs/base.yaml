@@ -9,6 +9,8 @@ model:
   # pooled_proj_dim: 1280  # SDXL only — omit or comment out for sd21
   num_img_tokens: 16
   num_heads: 8
+  num_pooler_layers: 2      # ResidualPooler depth (sd21 only)
+  pooler_self_attn: false   # include self-attn in pooler layers
 
 diffusion:
   num_timesteps: 1000
@@ -19,7 +21,13 @@ diffusion:
 training:
   # "full": train all UNet weights + ImageAdapter
   # "lora": freeze UNet base, train only LoRA deltas + ImageAdapter (requires peft)
-  training_mode: "lora"
+  # training_mode options:
+  #   "frozen" — freeze base UNet + text encoder; train only ImageAdapter + gated image cross-attn
+  #   "lora"   — freeze base UNet; train LoRA deltas + ImageAdapter
+  #   "full"   — train all UNet weights + ImageAdapter
+  training_mode: "frozen"
+  image_dropout_prob: 0.15   # fraction of batch to replace with null_image_tokens
+  image_cfg_scale: 2.0       # image CFG scale at inference (unused during training)
   lora_rank: 64
   lora_alpha: 64
   # lora_target_modules: null  # null = default ["to_q","to_k","to_v","to_out.0","to_add_out"]
@@ -32,8 +40,8 @@ training:
   gradient_checkpointing: true
   cfg_drop_prob: 0.10
   embedding_noise_std: 0.0   # std of Gaussian noise added to z_img_emb; 0 = disabled. ~0.01-0.05 recommended
-  lambda_sem: 0.1
-  sem_loss_every: 10
+  lambda_sem: 0.0          # semantic loss disabled (no qwen_enc at training time)
+  sem_loss_every: 10       # unused when lambda_sem=0
   log_every: 100
   plot_every: 100
   save_every: 10000
@@ -61,7 +69,9 @@ data:
   datasets:
     - name: "robobrain-dex"
       embedding_dir: "/share/project/congsheng/WMDEC_qwen/robobrain-dex-qwen-embedding/robobrain-dex"
-      image_dir: "/share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex"
+      # image_dir: "/share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex"
+      # Omit image_dir once preprocess_vae_latents.py has added z_vae to the .pt files.
+      # Training only needs z_img + z_vae; DataLoader I/O drops ~48× smaller.
     # Add more datasets below. Each needs a registered preprocessor in
     # data/preprocessors/__init__.py
     # - name: "my_new_dataset"

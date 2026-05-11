@@ -9,6 +9,20 @@ Rebalancing uses the verified frame counts from each dataset's stats.json
 (written by the preprocessing pipeline) so the sampling probabilities reflect
 the true dataset sizes rather than however many files happen to be on disk.
 Falls back to file counting if stats.json is not present.
+
+Batch keys
+----------
+  z_img        (N_patches, D)      Qwen patch embedding — always present
+  z_vae        (4, H/8, W/8)       Pre-computed VAE latent — present if run
+                                   preprocess_vae_latents.py first (recommended)
+  image        (3, H, W) float32   Raw image tensor in [-1,1] — only returned
+                                   when z_vae is absent AND image_dir is set
+  dataset_name str
+
+Training recommendation:
+  Run scripts/preprocess_vae_latents.py once to add z_vae to all .pt files.
+  Then set image_dir=null in config.  The DataLoader then returns only z_img +
+  z_vae — 48× smaller I/O than loading JPEGs.
 """
 
 from __future__ import annotations
@@ -103,6 +117,12 @@ class EmbeddingDataset(Dataset):
             "dataset_name": self.name,
         }
 
+        # --- VAE latent (preferred, pre-computed by preprocess_vae_latents.py) ---
+        if "z_vae" in data:
+            result["z_vae"] = data["z_vae"].float()   # (4, H/8, W/8)
+            return result
+
+        # --- Fallback: load raw image and return it for on-the-fly VAE encoding ---
         # Prefer the absolute path stored in the .pt file by the preprocessor
         # (_abs_image_path in extra_meta).  The embedding may use a flattened
         # directory structure that doesn't mirror the source image tree, so

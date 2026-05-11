@@ -1,55 +1,64 @@
 # Qwen Visual Embedding Decoder
 
-Reconstructs high-resolution images from frozen **Qwen3.5-4B** visual backbone embeddings
-using a **fine-tuned Stable Diffusion XL** latent diffusion model.
-Supports multiple heterogeneous datasets with automatic stats-based rebalancing.
+Reconstructs images from frozen **Qwen3.5-4B** visual patch embeddings using a
+**Stable Diffusion 2.1** latent diffusion model with gated decoupled image
+cross-attention — keeping SD's generative prior intact while injecting visual
+conditioning through a separate learnable branch.
 
 ---
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│  Encoding (frozen, offline)                                         │
-│                                                                     │
-│  image ──► Qwen3.5-4B Visual Encoder ──► (196, 2560) patches       │
-│            ViT hidden=1024, out_hidden=2560, patch=16, merge=2×2    │
-└────────────────────────────────┬────────────────────────────────────┘
-                                 │ stored as .pt  (bfloat16, ~1 MB/file)
-                                 │ includes _abs_image_path for training
-                                 ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│  Training  (trainable: ImageAdapter + SDXL UNet)                    │
-│                                                                     │
-│  (B, 196, 2560) patches                                             │
-│       │                                                             │
-│       ▼  ImageAdapter                                               │
-│       │  ├─ CrossAttentionPooler  ──► tokens      (B, 16, 2048)     │
-│       │  └─ Pooled MLP            ──► pooled_proj  (B, 1280)        │
-│       │                                                             │
-│       ▼  SDXL UNet2DConditionModel (full fine-tune or LoRA)         │
-│       │  encoder_hidden_states = tokens                             │
-│       │  added_cond_kwargs["text_embeds"] = pooled_proj             │
-│       │  added_cond_kwargs["time_ids"]    = [H,W,0,0,H,W]          │
-│       │                                                             │
-│  noise latent + timestep ──► denoised latent (B, 4, 128, 128)      │
-│                                                   │                 │
-│                              SDXL VAE decoder ◄──┘  (frozen)       │
-│                                   │                                 │
-│                         reconstructed image (B, 3, 1024, 1024)     │
-└─────────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────┐
+│  Offline preprocessing (run once)                                    │
+│                                                                      │
+│  image ──► Qwen3.5-4B Visual Encoder ──► (196, 2560) z_img patches  │
+│  image ──► SD 2.1 VAE Encoder        ──► (4, 56, 56) z_vae latent   │
+│                                                                      │
+│  Both saved in one .pt file per frame — no images needed at runtime  │
+└─────────────────────────────┬────────────────────────────────────────┘
+                              │  .pt  {"z_img": (196,2560), "z_vae": (4,56,56)}
+                              ▼
+┌──────────────────────────────────────────────────────────────────────┐
+│  Training  (frozen: base UNet + text encoder + Qwen + VAE)           │
+│  Trainable: ImageAdapter + GatedImageCrossAttention layers + gates   │
+│                                                                      │
+│  z_img (B, 196, 2560)                                                │
+│       │                                                              │
+│       ▼  PatchProjector (RMSNorm → MLP → scale)                     │
+│       ▼  ResidualPooler  (N×cross-attn + optional self-attn + FFN)   │
+│       │                                                              │
+│       image_tokens  (B, 16, 1024)                                    │
+│       │  ↓ image dropout 15% → null_image_tokens  (CFG training)     │
+│       │                                                              │
+│  z_vae (B, 4, 56, 56)  ── noise → x_t ──► SD 2.1 UNet               │
+│                                              │                       │
+│  Per transformer block:                      │                       │
+│    hidden = hidden                           │                       │
+│           + TextCrossAttn(hidden, empty_text)│  ← SD prior anchor    │
+│           + tanh(gate) × ImageCrossAttn(hidden, image_tokens)        │
+│                                              │  ← starts at 0        │
+│                                              ▼                       │
+│                                         v_pred                       │
+│                                              │                       │
+│                             SD 2.1 VAE decoder (frozen)              │
+│                                              │                       │
+│                                  reconstructed image                 │
+└──────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key design decisions
 
 | Component | Choice | Reason |
 |-----------|--------|--------|
-| Visual encoder | Qwen3.5-4B (frozen) | 196 spatial patch tokens × 2560 dim; ViT hidden=1024 projected via merger to 2560 |
-| Adapter | Perceiver cross-attn pooler | Compresses variable-length patches to fixed 16 tokens |
-| Diffusion backbone | SDXL UNet (full fine-tune or LoRA) | Pretrained priors → high-quality textures immediately |
-| VAE | SDXL VAE (**frozen**, scale=0.13025) | VAE training requires separate GAN pipeline; not trained here |
-| Conditioning | Dual: tokens + pooled\_proj | Required by SDXL `addition_embed_type="text_time"` |
-| Noise schedule | Loaded from SDXL pretrained | Exact match to UNet training distribution |
+| Backbone | SD 2.1-base (v-prediction) | 865M params, 56×56 latent at 448px; smaller than SDXL |
+| Conditioning | **Gated decoupled image cross-attn** | Preserves SD generative prior; gates = 0 → starts as vanilla SD |
+| Empty text prior | `CLIPTextModel("")` cached once | Stable anchor for SD's existing cross-attn (attn2) |
+| ImageAdapter | Multi-layer ResidualPooler | Deeper compression: RMSNorm→MLP→scale, 2-layer cross-attn pooler |
+| Null image tokens | Learnable `nn.Parameter(zeros)` | Enables image-CFG at inference; trained with 15% dropout |
+| Training mode | `frozen` | Only ~50–200M params trained; saves ~5 GB VRAM per GPU |
+| VAE latents | Pre-computed offline | 48× smaller I/O than loading JPEGs; removes VAE from training GPU |
 
 ---
 
@@ -58,45 +67,54 @@ Supports multiple heterogeneous datasets with automatic stats-based rebalancing.
 ```
 project/
 ├── models/
-│   ├── qwen_visual_encoder.py   # Frozen Qwen3.5-4B visual backbone
-│   │                            #   - from_standalone(): loads .pt checkpoint
-│   │                            #   - encode_images(): strict (B,196,2560) contract
-│   ├── adapter.py               # CrossAttentionPooler → (tokens, pooled_proj)
-│   ├── unet.py                  # SDXLUNet wrapper; setup_lora() for LoRA mode
-│   └── vae.py                   # SDXL VAE wrapper (frozen, scaling_factor auto-read)
+│   ├── qwen_visual_encoder.py      # Frozen Qwen3.5-4B visual backbone (196×2560)
+│   ├── image_cross_attention.py    # GatedImageCrossAttention + UNetImageConditioner
+│   │                               #   - hooks on every BasicTransformerBlock
+│   │                               #   - gate initialised to 0 → pure SD at step 0
+│   ├── adapter.py                  # ImageAdapter: PatchProjector + ResidualPooler
+│   │                               #   - null_image_tokens for image-CFG training
+│   ├── unet.py                     # LDMUNet (SD 2.1): frozen CLIP text encoder,
+│   │                               #   empty_text_emb buffer, conditioner injection
+│   └── vae.py                      # VAE wrapper (frozen; decode only during training)
 │
 ├── diffusion/
-│   ├── scheduler.py             # DDPMScheduler loaded from SDXL pretrained
-│   └── sampler.py               # DDIMSampler for inference
+│   ├── scheduler.py                # DDPMScheduler from SD 2.1 pretrained
+│   └── sampler.py                  # DDIMSampler for inference
 │
 ├── training/
-│   ├── train.py                 # Multi-process DDP training (torchrun)
-│   ├── train_single.py          # Single-process multi-GPU via device_map="auto"
-│   ├── validate.py              # Fast val (loss+cosine) + full val (DDIM+LPIPS)
-│   ├── loss.py                  # Diffusion loss + Qwen semantic consistency
-│   └── cfg.py                   # CFG dropout (tokens + pooled zeroed atomically)
+│   ├── train.py                    # Multi-GPU DDP (torchrun)
+│   ├── train_compile.py            # DDP + torch.compile (~15–30% faster on H100)
+│   ├── validate.py                 # Fast val (diffusion loss) + full val (DDIM+LPIPS)
+│   ├── loss.py                     # DiffusionLoss (MSE only; semantic loss removed)
+│   └── cfg.py                      # apply_condition_dropout + apply_image_dropout
 │
 ├── data/
-│   ├── dataset.py               # MultiDatasetEmbeddingDataset + samplers
-│   │                            #   - reads _abs_image_path from .pt for true GT
-│   ├── stats.py                 # Statistics collection, printing, JSON persistence
+│   ├── dataset.py                  # MultiDatasetEmbeddingDataset + samplers
+│   │                               #   - returns z_vae from .pt if present (fast path)
+│   │                               #   - falls back to image loading if z_vae absent
+│   ├── stats.py                    # Statistics collection and JSON persistence
 │   └── preprocessors/
-│       ├── __init__.py          # PREPROCESSORS registry
-│       ├── base.py              # BaseDatasetPreprocessor (abstract API)
-│       │                        #   - saves _abs_image_path in every .pt
-│       └── robobrain_dex.py     # RoboBrain-Dex implementation (flattened rel_path)
+│       ├── __init__.py             # PREPROCESSORS registry
+│       ├── base.py                 # BaseDatasetPreprocessor (streaming iter_samples)
+│       ├── robobrain_dex.py        # RoboBrain-Dex layout
+│       └── lerobot.py              # LeRobot layout (with + without text)
 │
 ├── configs/
-│   └── base.yaml                # All hyperparameters incl. training_mode
+│   └── base.yaml                   # All hyperparameters
 │
-├── inference/
-│   └── sample.py                # Reconstruct image from .pt embedding
+├── evaluation/
+│   ├── metrics.py                  # PSNR, LPIPSMetric, MetricAccumulator
+│   └── visualize.py                # save_comparison_grid (GT | reconstruction)
 │
-└── scripts/
-    ├── extract_qwen_visual_encoder.py   # Step 0: save standalone visual backbone
-    │                                    #   saves visual_cls_name for exact reconstruction
-    ├── preprocess_embeddings.py         # Step 1: offline embedding extraction
-    └── preprocess_config.yaml          # Multi-dataset preprocessing config
+├── scripts/
+│   ├── extract_qwen_visual_encoder.py  # Step 0: save standalone visual backbone .pt
+│   ├── preprocess_embeddings.py        # Step 1: offline Qwen embedding extraction
+│   ├── preprocess_vae_latents.py       # Step 2: add z_vae to existing .pt files
+│   ├── eval_vae.py                     # Evaluate VAE reconstruction quality
+│   └── preprocess_config.yaml         # Multi-dataset preprocessing config
+│
+└── inference/
+    └── sample.py                   # Reconstruct image from .pt embedding
 ```
 
 ---
@@ -104,30 +122,24 @@ project/
 ## Environment Setup
 
 ```bash
-conda create -n qwen_sdxl_decoder python=3.10 -y
-conda activate qwen_sdxl_decoder
+conda create -n qwen_decoder python=3.10 -y
+conda activate qwen_decoder
 
 # PyTorch (CUDA 12.1)
-pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https://download.pytorch.org/whl/cu124
+pip install torch==2.4.0 torchvision==0.19.0 --index-url https://download.pytorch.org/whl/cu124
 
 # Core dependencies
-pip install "diffusers==0.30.3"          # pin — newer versions break with PyTorch <2.4
-pip install accelerate "transformers>=4.57.0.dev0"
+pip install "diffusers==0.30.3" accelerate "transformers>=4.57.0.dev0"
 pip install pillow tqdm pyyaml lpips matplotlib qwen-vl-utils
-pip install peft                         # required for LoRA mode only
+pip install peft   # only needed for training_mode: "lora"
 ```
 
-> **Version notes:**
-> - `diffusers==0.30.3` — newer versions (0.31+) use flash_attn_3 annotations incompatible with PyTorch <2.4
-> - `transformers>=4.57.0.dev0` — required for `Qwen3_5ForConditionalGeneration`
-> - `peft` — only needed when `training_mode: "lora"` in config
+> `diffusers==0.30.3` pinned — newer versions use flash_attn_3 annotations incompatible with PyTorch < 2.4.
+> `transformers>=4.57.0.dev0` required for `Qwen3_5ForConditionalGeneration`.
 
 ---
 
-## Step 0 — Extract the Qwen Visual Backbone (once)
-
-Extract the ViT tower from the full Qwen3.5-4B model (~9 GB) and save it as a
-standalone `.pt` checkpoint. Run once; the full model can be deleted after.
+## Step 0 — Extract Qwen Visual Backbone (once)
 
 ```bash
 python scripts/extract_qwen_visual_encoder.py \
@@ -135,252 +147,165 @@ python scripts/extract_qwen_visual_encoder.py \
     --output /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
 ```
 
-The checkpoint stores:
-- `state_dict` — visual tower weights (`model.model.visual`)
-- `vision_config` — config dict for reconstruction
-- `hidden_size` — `out_hidden_size = 2560`
-- `visual_cls_name` / `visual_cls_module` — exact class used (e.g. `Qwen3_5VisionTransformer`)
-
-> **Important:** The visual tower is at `model.model.visual` (not `model.visual`).
-> The class saved in `visual_cls_name` is used at load time to ensure the merger
-> (1024→2560 projection) runs correctly. Re-extract if upgrading transformers.
+Saves: `state_dict`, `vision_config`, `hidden_size=2560`, `visual_cls_name` / `visual_cls_module`
+(required for the merger to run correctly at load time).
 
 ---
 
-## Step 1 — Preprocess Datasets (Offline, Multi-GPU)
-
-Encodes all images through the frozen Qwen visual encoder and stores `(196, 2560)`
-patch embeddings on disk. Each `.pt` file also stores `_abs_image_path` so the
-training dataloader can load the true GT image without relying on path reconstruction.
-
-### Single dataset
+## Step 1 — Extract Qwen Embeddings (multi-GPU, resumable)
 
 ```bash
-torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
+# Single dataset
+torchrun --nproc_per_node=8 scripts/preprocess_embeddings.py \
     --dataset robobrain-dex \
-    --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
+    --image_dir /share/project/hotel/.../robobrain-dex \
     --output_dir /share/project/congsheng/robobrain-dex-qwen-embedding \
     --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt \
     --batch_size 16
-```
 
-### Multiple datasets (via config)
-
-```bash
-torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
+# Multiple datasets + cycle limit (recommended for millions of files)
+torchrun --nproc_per_node=8 scripts/preprocess_embeddings.py \
     --config scripts/preprocess_config.yaml \
-    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
+    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt \
+    --max_frames_per_cycle 50000
 ```
 
-`scripts/preprocess_config.yaml`:
-```yaml
-output_root: /share/project/congsheng/all-qwen-embeddings
-
-datasets:
-  - name: robobrain-dex
-    image_dir: /share/project/hotel/.../robobrain-dex
-  - name: my-new-dataset
-    image_dir: /share/.../my_new_dataset
-```
-
-### Output layout
-
-```
-{output_root}/{dataset_name}/
-    stats.json                  ← frame counts, per-task breakdown, timing, disk size
-    {task}/{episode}/{frame}.pt ← {"z_img": (196,2560), "_abs_image_path": str, ...}
-```
-
-> **embedding_dir in training config must point to `{output_root}/{dataset_name}/`**,
-> not `{output_root}/`. The preprocessor nests files under the dataset name subdirectory.
-
-### Statistics output
-
-```
-────────────────────────────────────────────────────────────
-  Dataset : robobrain-dex
-────────────────────────────────────────────────────────────
-  Total frames    :    1,234,567
-  Written         :      987,654
-  Skipped (cached):      246,913
-  Processing time :      2h 34m
-  Output size     :       2.31 GB
-  Per-group breakdown: pick_and_place 45,678 (3.7%) ...
-════════════════════════════════════════════════════════════
-  COMBINED STATISTICS  (2 dataset(s))
-════════════════════════════════════════════════════════════
-  robobrain-dex       1,234,567  (72.3%)
-  my-new-dataset        472,890  (27.7%)
-  TOTAL               1,707,457
-```
-
-Processing is **resumable**: existing `.pt` files are skipped (atomic `.tmp` → rename).
+Output per frame: `{"z_img": (196, 2560), "_abs_image_path": str}` + `stats.json`.
+Re-run is safe — existing `.pt` files are skipped via in-memory set.
 
 ---
 
-## Step 2 — Training
+## Step 2 — Add VAE Latents (multi-GPU, resumable)
 
-Two launch modes are available. Both support `full` fine-tune and `LoRA` via
-`training_mode` in the config.
-
-### Mode A — Multi-process DDP (recommended for throughput)
-
-Each GPU holds a full model copy; gradients are averaged across ranks.
+Adds `z_vae: (4, 56, 56) float16` to each existing `.pt` file.
+Run this once after Step 1 before training — it **removes the VAE and image I/O
+entirely from the training loop** (48× smaller DataLoader reads).
 
 ```bash
-torchrun --nproc_per_node=4 training/train.py --config configs/base.yaml
+torchrun --nproc_per_node=8 scripts/preprocess_vae_latents.py \
+    --embedding_dir /share/project/congsheng/robobrain-dex-qwen-embedding/robobrain-dex \
+    --unet_name Manojb/stable-diffusion-2-1-base \
+    --resolution 448 \
+    --batch_size 64
 ```
 
-### Mode B — Single-process model parallelism (no torchrun needed)
+Re-run is safe — `.pt` files that already have `z_vae` are skipped.
 
-The UNet is automatically sharded across all GPUs via `device_map="auto"`.
-One Python process owns all GPUs — useful when the model is too large for one GPU
-or for simpler single-process debugging.
+After this step, set `image_dir: null` in `configs/base.yaml` — the dataset will
+load only `z_img + z_vae` with no image I/O.
+
+---
+
+## Step 3 — Training
+
+### Multi-GPU DDP (recommended)
 
 ```bash
-python training/train_single.py --config configs/base.yaml
+torchrun --nproc_per_node=8 training/train.py --config configs/base.yaml
 ```
 
-| | DDP (`train.py`) | Single-process (`train_single.py`) |
-|---|---|---|
-| Launch | `torchrun --nproc_per_node=N` | `python training/train_single.py` |
-| Model placement | 1 full copy per GPU | UNet sharded via `device_map="auto"` |
-| Effective batch | `batch_per_gpu × N_gpus` | `batch_per_gpu` |
-| Best for | Max throughput | Large model / debugging |
+### Multi-GPU DDP + torch.compile (~15–30% faster on H100, non-LoRA/frozen modes)
 
-### Training mode (full vs LoRA)
-
-Set in `configs/base.yaml`:
-
-```yaml
-training:
-  training_mode: "full"   # or "lora"
-  lora_rank: 64
-  lora_alpha: 64
-  # lora_target_modules: null  # null = ["to_q","to_k","to_v","to_out.0","to_add_out"]
-```
-
-| Mode | Trainable params | Checkpoint |
-|------|-----------------|------------|
-| `full` | All UNet weights + ImageAdapter (~2.6B) | `step_N.pt` (full state_dict) |
-| `lora` | LoRA deltas + ImageAdapter (~50–100M) | `lora_step_N/` dir + `step_N.pt` (adapter only) |
-
-LoRA mode requires `pip install peft`.
-
-### Multi-dataset rebalancing
-
-Sampling probabilities are derived from verified frame counts in `stats.json`:
-
-```
-p_i  =  n_i^α  /  Σ_j  n_j^α
-```
-
-| α | Effect |
-|---|--------|
-| `1.0` | Proportional — large datasets dominate |
-| `0.7` | Recommended — moderate smoothing |
-| `0.5` | Square-root smoothing |
-| `0.0` | Fully balanced — equal probability per dataset |
-
-Configure datasets in `configs/base.yaml`:
-
-```yaml
-data:
-  rebalance_alpha: 0.7
-  datasets:
-    - name: "robobrain-dex"
-      # Point to the dataset_name subdirectory, not the output_dir root
-      embedding_dir: "/share/project/congsheng/robobrain-dex-qwen-embedding/robobrain-dex"
-      image_dir: "/share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex"
-    - name: "my-new-dataset"
-      embedding_dir: "/share/project/congsheng/my-new-dataset-qwen-embedding/my-new-dataset"
-      image_dir: "/share/.../my_new_dataset"
-```
-
-### Training config reference
-
-| Parameter | Default | Notes |
-|-----------|---------|-------|
-| Base model | `stabilityai/stable-diffusion-xl-base-1.0` | SDXL UNet + VAE + scheduler |
-| `training_mode` | `"full"` | `"full"` or `"lora"` |
-| Resolution | 1024×1024 | Latent 128×128 |
-| Per-GPU batch | 1 | ×4 GPUs = global 4 in DDP |
-| Max steps | 300k | |
-| Learning rate | 5e-5 | |
-| Grad checkpointing | enabled | Required for 1024px on H100 |
-| CFG drop prob | 10% | `tokens` and `pooled_proj` zeroed atomically |
-| λ semantic loss | 0.1 | `1 − cosine(Qwen(x̂), z_img)` every 10 steps |
-| `rebalance_alpha` | 0.7 | Stats-based temperature sampling |
-
-> **VAE is frozen** — SDXL VAE is used only as a fixed encoder/decoder.
-> VAE fine-tuning requires a separate GAN training pipeline and is not performed here.
-
-> **VRAM note:** Full fine-tune SDXL (~2.6B) + grad checkpointing ≈ 40–65 GB/GPU.
-> Use LoRA mode or `train_single.py` with `device_map` to reduce per-GPU footprint.
-
-### Loss function
-
-```
-L = L_diff + λ · L_sem
-
-L_diff  =  MSE(ε_pred, ε)
-L_sem   =  1 − cosine(mean_pool(Qwen(x̂₀)), mean_pool(z_img))
-```
-
-`L_sem` is computed every `sem_loss_every` steps (default 10) to amortise
-re-encoding cost through the frozen Qwen encoder.
-
-### Validation
-
-Automatically runs on rank 0 during training:
-
-```yaml
-validation:
-  val_every: 5000        # fast val: diffusion loss + cosine similarity
-  val_full_every: 20000  # full val: 20-step DDIM + LPIPS + saves image grid
-  val_num_samples: 200   # samples (subset of train data if val_datasets not set)
-  best_metric: "val/cosine_sim"  # saves best.pt when this improves
-```
-
-Best checkpoint is saved to `{output_dir}/checkpoints/best.pt`.
-
-### Visualization
-
-Every `visualize_every` steps, a GT vs reconstruction grid is saved to
-`{output_dir}/visualizations/step_N.png`.
-
-- **GT** — true images loaded from `image_dir` via `_abs_image_path` in the `.pt` file
-- **Pred** — 10-step DDIM sample conditioned on the Qwen embedding (no CFG dropout)
-
-### Outputs
-
-```
-{output_dir}/
-├── checkpoints/
-│   ├── step_N.pt            ← periodic checkpoint
-│   ├── lora_step_N/         ← LoRA delta weights (lora mode only)
-│   └── best.pt              ← best val checkpoint
-├── visualizations/step_N.png
-├── plots/loss_curve.png
-├── val_images/step_N.png    ← full-val GT vs DDIM reconstruction
-└── final.pt
+```bash
+torchrun --nproc_per_node=8 training/train_compile.py --config configs/base.yaml
 ```
 
 ### Resume from checkpoint
 
 ```bash
-# DDP
-torchrun --nproc_per_node=4 training/train.py \
-    --config configs/base.yaml --resume /path/to/checkpoints/step_50000.pt
-
-# Single-process
-python training/train_single.py \
-    --config configs/base.yaml --resume /path/to/checkpoints/step_50000.pt
+torchrun --nproc_per_node=8 training/train.py \
+    --config configs/base.yaml \
+    --resume /path/to/checkpoints/step_50000.pt
 ```
+
+### Training modes
+
+Set `training_mode` in `configs/base.yaml`:
+
+| Mode | Trainable | VRAM/GPU | Checkpoint |
+|------|-----------|----------|------------|
+| `frozen` | ImageAdapter + GatedImageCrossAttention layers + gates (~50–200M) | ~20 GB | `img_adapter` + `conditioner` |
+| `lora` | LoRA deltas + ImageAdapter (~50–100M) | ~30 GB | `lora_step_N/` + `img_adapter` |
+| `full` | All UNet weights + ImageAdapter (~900M) | ~40–65 GB | full `unet` state dict |
+
+**`frozen` is the recommended mode** — the gated image cross-attention starts at zero
+(pure SD 2.1 at step 0) and gradually opens as the model learns the image signal,
+preserving SD's generative prior throughout training.
+
+### Key config parameters
+
+```yaml
+model:
+  backbone: "sd21"
+  unet_name: "Manojb/stable-diffusion-2-1-base"
+  qwen_dim: 2560
+  cross_attn_dim: 1024          # image cross-attn token dim
+  num_img_tokens: 16
+  num_heads: 8
+  num_pooler_layers: 2          # ResidualPooler depth
+  pooler_self_attn: false
+
+training:
+  training_mode: "frozen"
+  batch_size_per_gpu: 96        # safe at 80 GB H100 with pre-computed latents
+  image_dropout_prob: 0.15      # fraction replaced by null_image_tokens (image CFG)
+  embedding_noise_std: 0.0      # Gaussian noise on z_img for robustness (~0.01–0.05)
+  lambda_sem: 0.0               # semantic loss disabled (Qwen not loaded at train time)
+  gradient_checkpointing: false # not needed in frozen mode; UNet is frozen
+
+data:
+  resolution: 448               # latent 56×56×4
+  datasets:
+    - name: "robobrain-dex"
+      embedding_dir: "/share/project/congsheng/WMDEC_qwen/.../robobrain-dex"
+      # image_dir: omit once preprocess_vae_latents.py has run
+```
+
+### Checkpoint format (frozen mode)
+
+```
+step_N.pt:
+  step:         int
+  img_adapter:  state_dict   ← ImageAdapter weights
+  conditioner:  state_dict   ← GatedImageCrossAttention layers + gates
+  optimizer:    state_dict
+  lr_scheduler: state_dict
+  scaler:       state_dict
+```
+
+### Efficiency summary
+
+| Optimization | Saving |
+|---|---|
+| Pre-computed VAE latents | 48× smaller DataLoader I/O; removes VAE from training GPU |
+| Frozen UNet (no backprop through 865M params) | 2–4× larger batch at same VRAM |
+| No semantic loss | Removes Qwen4B (~4.5 GB) + VAE decode from training GPU |
+| Gradient checkpointing OFF | Not needed with frozen UNet |
+| torch.compile (non-frozen) | +15–30% throughput on H100 |
+
+### Validation
+
+```yaml
+validation:
+  val_every: 20000         # fast: diffusion loss + cosine similarity
+  val_full_every: 50000    # full: DDIM generation + LPIPS + saves grid
+  best_metric: "val/cosine_sim"
+```
+
+Best checkpoint saved to `{output_dir}/checkpoints/best.pt`.
+
+### Multi-dataset rebalancing
+
+```
+p_i  =  n_i^α  /  Σ_j  n_j^α
+```
+
+α=0.7 recommended: moderate smoothing, prevents large datasets from fully
+dominating. Probabilities derived from verified `stats.json` frame counts.
 
 ---
 
-## Step 3 — Inference
+## Step 4 — Inference
 
 ```bash
 python inference/sample.py \
@@ -392,41 +317,80 @@ python inference/sample.py \
     --steps 50
 ```
 
+Image CFG at inference:
+```
+ε_final = ε_uncond + scale × (ε_cond − ε_uncond)
+```
+where `ε_uncond` uses `null_image_tokens` (learned during training).
+
+---
+
+## Training Budget (64 × H100 80 GB)
+
+Assumptions: `frozen` mode, SD 2.1, pre-computed latents, `batch_size_per_gpu=128`.
+
+| | |
+|---|---|
+| Global batch size | 64 × 128 = **8,192** |
+| Steps per epoch (32M frames) | 32M / 8192 ≈ 3,900 steps |
+| Estimated step time | ~120–150 ms |
+| Time per epoch | ~8–10 min |
+
+| Steps | Effective passes | Wall time | Cost @ $3.50/GPU/hr |
+|-------|-----------------|-----------|---------------------|
+| 200K | 51× | ~8 h | ~$1,800 |
+| **300K** | **77×** | **~12 h** | **~$2,700** ← recommended |
+| 500K | 128× | ~20 h | ~$4,500 |
+
+Start evaluating at step 50K–100K (`val/cosine_sim` should be rising).
+Convergence typically plateaus at 200K–300K steps for this data scale.
+
+---
+
+## Evaluation
+
+```bash
+# VAE reconstruction quality (baseline ceiling)
+torchrun --nproc_per_node=4 scripts/eval_vae.py \
+    --config configs/base.yaml \
+    --num_samples 1000 \
+    --vis_samples 16 \
+    --vis_output vae_reconstruction.png
+```
+
+| Metric | Description | Direction |
+|--------|-------------|-----------|
+| Cosine similarity (Qwen) | `cosine(mean_pool(Qwen(x̂)), mean_pool(z_img))` | ↑ higher |
+| LPIPS (VGG) | Perceptual distance from GT | ↓ lower |
+| PSNR | Pixel-level reconstruction | ↑ higher |
+
 ---
 
 ## Adding a New Dataset
 
-1. **Implement the preprocessor** (`data/preprocessors/my_dataset.py`):
+1. **Implement preprocessor** (`data/preprocessors/my_dataset.py`):
 
 ```python
 from data.preprocessors.base import BaseDatasetPreprocessor, SampleMeta
-from pathlib import Path
 from PIL import Image
 
 class MyDatasetPreprocessor(BaseDatasetPreprocessor):
-
     @property
     def dataset_name(self) -> str:
         return "my-dataset"
 
-    def find_samples(self):
-        samples = []
+    def iter_samples(self):
         for img_path in sorted(self.image_root.rglob("*.jpg")):
-            rel = img_path.relative_to(self.image_root)
-            samples.append(SampleMeta(
-                rel_path=rel,
-                extra_meta={
-                    "split": rel.parts[0],
-                    "_abs_image_path": str(img_path),  # required for GT loading
-                },
-            ))
-        return samples
+            yield SampleMeta(
+                rel_path=img_path.relative_to(self.image_root),
+                extra_meta={"_abs_image_path": str(img_path)},
+            )
 
     def load_image(self, sample: SampleMeta) -> Image.Image:
         return Image.open(sample.extra_meta["_abs_image_path"]).convert("RGB")
 ```
 
-2. **Register it** (`data/preprocessors/__init__.py`):
+2. **Register** in `data/preprocessors/__init__.py`:
 
 ```python
 PREPROCESSORS = {
@@ -435,42 +399,31 @@ PREPROCESSORS = {
 }
 ```
 
-3. **Add to configs** (preprocessing + training):
+3. **Add to both configs**:
 
 ```yaml
 # scripts/preprocess_config.yaml
 datasets:
   - name: my-dataset
-    image_dir: /path/to/my/images
+    image_dir: /path/to/images
 
 # configs/base.yaml
 data:
   datasets:
     - name: my-dataset
       embedding_dir: /path/to/my-dataset-qwen-embedding/my-dataset
-      image_dir: /path/to/my/images
 ```
 
-> **Note:** always include `_abs_image_path` in `extra_meta` so the training
-> dataloader can load true GT images regardless of the stored `rel_path` structure.
-
----
-
-## Evaluation
-
-| Metric | Description | Target |
-|--------|-------------|--------|
-| Cosine similarity (Qwen) | `cosine(mean_pool(Qwen(x̂)), mean_pool(z_img))` | ↑ higher |
-| LPIPS | Perceptual similarity (VGG) | ↓ lower |
-| FID | Distribution-level quality (optional) | ↓ lower |
+Always include `_abs_image_path` in `extra_meta` — it is stored in the `.pt`
+and used by `preprocess_vae_latents.py` to find the image for VAE encoding.
 
 ---
 
 ## Development Roadmap
 
-1. Extract Qwen visual backbone → `scripts/extract_qwen_visual_encoder.py`
-2. Preprocess datasets → `scripts/preprocess_embeddings.py`
-3. Train with DDP or single-process → `training/train.py` / `training/train_single.py`
-4. Monitor via validation metrics and `val_images/` grids
-5. Evaluate reconstruction quality (LPIPS, cosine sim)
-6. Scale to additional datasets by implementing `BaseDatasetPreprocessor`
+1. `scripts/extract_qwen_visual_encoder.py` — extract Qwen visual tower
+2. `scripts/preprocess_embeddings.py` — offline Qwen embedding extraction
+3. `scripts/preprocess_vae_latents.py` — add VAE latents to .pt files
+4. `training/train.py` — DDP training with frozen SD 2.1 + gated image cross-attn
+5. Monitor `val/cosine_sim` and visualization grids; save best checkpoint
+6. `inference/sample.py` — image-CFG inference with null tokens
