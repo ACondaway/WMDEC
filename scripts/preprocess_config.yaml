@@ -1,24 +1,103 @@
 # Multi-dataset preprocessing config for preprocess_embeddings.py
-# Embeddings are stored under: {output_root}/{name}/...
+#
+# All datasets are sourced from /share/project/hotel/lerobot_multiimage_data_1fps/event/
+# All use type=lerobot_without_text (no text encoder pass, task_name always "")
 #
 # Fields per dataset:
-#   name       — output subdirectory name (any string you choose)
+#   name       — output subdirectory name under output_root
 #   image_dir  — absolute path to dataset root
-#   type       — schema type (registry key in data/preprocessors/__init__.py)
-#                Omit when type == name (e.g. robobrain-dex)
-#   camera_key — (lerobot only) subdirectory under observation.images.*; default "image"
+#   type       — schema type (lerobot_without_text for all entries here)
+#   camera_key — (optional) camera subdirectory under observation.images.*
+#                Default is "image". Only set when the dataset uses a different key.
+#
+# Multi-camera datasets (galbot_real, agibot_world_multiview) list one representative
+# camera. Add duplicate entries with different names/camera_key to embed more views.
 
-output_root: /share/project/congsheng/all-qwen-embeddings
+output_root: /share/project/congsheng/all-qwen-embeddings-event-all-256
 
 datasets:
-  - name: robobrain-dex
-    image_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex
-    # type defaults to name → uses RoboBrainDexPreprocessor
+  # ── Single-camera datasets (camera_key: image) ──────────────────────────
 
-  - name: ego-dex
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/egodex_1fps_refreshed
-    type: lerobot
+  - name: EgoExoLearn
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/EgoExoLearn
+    type: lerobot_without_text
 
-  - name: gen-ego-data
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/GenEgoData
-    type: lerobot
+  - name: Gen-EgoData
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/Gen-EgoData
+    type: lerobot_without_text
+
+  - name: agibot_world
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/agibot_world
+    type: lerobot_without_text
+
+  - name: ego4d1
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/ego4d1
+    type: lerobot_without_text
+
+  - name: egocentric10k
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/egocentric10k
+    type: lerobot_without_text
+
+  - name: egodex
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/egodex
+    type: lerobot_without_text
+
+  - name: em_interaction
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/em_interaction
+    type: lerobot_without_text
+
+  - name: epic_kitchens
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/epic_kitchens
+    type: lerobot_without_text
+
+  - name: hoi4d
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/hoi4d
+    type: lerobot_without_text
+
+  - name: kinetics
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/kinetics
+    type: lerobot_without_text
+
+  - name: llava-178k
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/llava-178k
+    type: lerobot_without_text
+
+  - name: llava-178k-ex
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/llava-178k-ex
+    type: lerobot_without_text
+
+  - name: pe_video_extended
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/pe_video_extended
+    type: lerobot_without_text
+
+  - name: pe_video_traintest
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/pe_video_traintest
+    type: lerobot_without_text
+
+  - name: psi_ego
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/psi_ego
+    type: lerobot_without_text
+
+  - name: something_something_v2
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/something_something_v2
+    type: lerobot_without_text
+
+  # ── Multi-camera datasets ────────────────────────────────────────────────
+  # galbot_real has: left_head, left_wrist, right_head, right_wrist
+  # Add extra entries below (with different name) to embed additional views.
+
+  - name: galbot_real
+    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/galbot_real
+    type: lerobot_without_text
+    camera_key: left_head
+
+  # agibot_world_multiview has: hand_left_color, hand_right_color, head_color
+
+  # - name: agibot_world_multiview
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/agibot_world_multiview
+  #   type: lerobot_without_text
+  #   camera_key: hand_left_color
+
+  # ── Skipped (backup directories, identical content) ──────────────────────
+  # agibot_world_multiview-bak  — backup of agibot_world_multiview
+  # pe_video_extended_bak       — backup of pe_video_extended

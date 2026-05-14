@@ -2,3 +2,5 @@ __pycache__/
 train.yaml
 *.png
 vae_eval_results.json
+logs/
+*.bak

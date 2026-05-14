@@ -114,6 +114,7 @@ pip install torch==2.4.0 torchvision==0.19.0 torchaudio==2.4.0 --index-url https
 pip install "diffusers==0.30.3"          # pin — newer versions break with PyTorch <2.4
 pip install accelerate "transformers>=4.57.0.dev0"
 pip install pillow tqdm pyyaml lpips matplotlib qwen-vl-utils
+pip install 
 pip install peft                         # required for LoRA mode only
 ```
 
@@ -132,7 +133,7 @@ standalone `.pt` checkpoint. Run once; the full model can be deleted after.
 ```bash
 python scripts/extract_qwen_visual_encoder.py \
     --model_name Qwen/Qwen3.5-4B \
-    --output /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
+    --output /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt
 ```
 
 The checkpoint stores:
@@ -156,20 +157,20 @@ training dataloader can load the true GT image without relying on path reconstru
 ### Single dataset
 
 ```bash
-torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
+torchrun --nproc_per_node=1 scripts/preprocess_embeddings.py \
     --dataset robobrain-dex \
     --image_dir /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex \
-    --output_dir /share/project/congsheng/robobrain-dex-qwen-embedding \
-    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt \
+    --output_dir /share/project/congsheng/robobrain-dex-qwen-embedding-t \
+    --encoder_ckpt /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt \
     --batch_size 16
 ```
 
 ### Multiple datasets (via config)
 
 ```bash
-torchrun --nproc_per_node=4 scripts/preprocess_embeddings.py \
+torchrun --nproc_per_node=1 scripts/preprocess_embeddings.py \
     --config scripts/preprocess_config.yaml \
-    --encoder_ckpt /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
+    --encoder_ckpt /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt
 ```
 
 `scripts/preprocess_config.yaml`:

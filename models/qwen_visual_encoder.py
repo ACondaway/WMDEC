@@ -84,8 +84,8 @@ _patch_infer_schema_for_string_annotations()
 #   output : (196, 2560) patch features
 # 448/16 = 28 patches per side → 28×28 = 784 → 2×2 spatial merge → 196 tokens
 # 1024 ViT hidden dim → merger projects to out_hidden_size = 2560
-_INPUT_SIZE = 448
-_TOKENS_PER_IMAGE = 196
+_INPUT_SIZE = 256
+_TOKENS_PER_IMAGE = 64
 _FEATURE_DIM = 2560
 
 
@@ -219,7 +219,7 @@ class QwenVisualEncoder(nn.Module):
 
         # Resize to exactly 448×448 so the image_processor produces the expected
         # grid_thw ([T, H, W] patch grid) that the visual merger requires.
-        images_448 = [img.convert("RGB").resize((_INPUT_SIZE, _INPUT_SIZE), Image.BICUBIC) for img in images]
+        images_448 = [img.convert("RGB").resize((_INPUT_SIZE, _INPUT_SIZE)) for img in images]
 
         # Call the image_processor directly (bypasses text tokenizer) to get
         # pixel_values and image_grid_thw.
