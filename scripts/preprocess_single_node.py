@@ -272,7 +272,11 @@ def _prescan_job(job: dict, num_gpus: int) -> list[dict]:
 
     print(f"[{preprocessor.dataset_name}] Scanning existing embeddings ...")
     processed_set = set(preprocessor.build_processed_set())
-    print(f"[{preprocessor.dataset_name}] {len(processed_set):,} frames already done — will skip")
+    n_done = len(processed_set)
+    if n_done:
+        print(f"[{preprocessor.dataset_name}] {n_done:,} frames already embedded — will skip, processing remaining {len(all_samples) - n_done:,}")
+    else:
+        print(f"[{preprocessor.dataset_name}] No existing embeddings found — processing all {len(all_samples):,} frames")
 
     return [
         {
