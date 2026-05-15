@@ -3,9 +3,17 @@ Single-node multi-GPU offline preprocessing.
 
 Replaces torchrun / torch.distributed entirely. Uses torch.multiprocessing.spawn
 to launch one worker process per GPU. Workers are fully independent — no NCCL,
-no rendezvous, no collective ops. Each GPU processes its own shard of the dataset
-(modulo interleaving via iter_samples_for_rank) and writes embeddings directly to
-disk. Stats are returned to the main process via a multiprocessing.Queue.
+no rendezvous, no collective ops.
+
+Key optimization for large datasets (1M+ frames)
+-------------------------------------------------
+All expensive filesystem scans happen ONCE in the main process before workers
+are spawned:
+  1. iter_samples() — walks the source dataset once, splits into per-GPU shards.
+  2. build_processed_set() — walks the output dir once to find existing .pt files.
+
+Each worker receives its pre-computed shard and the shared processed_set, so
+there is zero redundant I/O regardless of how many GPUs are used.
 
 Usage — single dataset:
     python scripts/preprocess_single_node.py \\
@@ -55,18 +63,24 @@ from data.stats import (
 
 
 # ---------------------------------------------------------------------------
-# Prefetch producer (identical logic to multi-node version)
+# Prefetch producer — operates on a pre-computed shard (list of SampleMeta)
 # ---------------------------------------------------------------------------
 
 def _prefetch_worker(
     preprocessor: BaseDatasetPreprocessor,
-    rank: int,
-    world_size: int,
+    shard: list,
     batch_size: int,
     num_io_workers: int,
     processed_set: set,
     out_q: "queue.Queue",
 ) -> None:
+    """
+    Background producer thread.
+
+    Iterates the pre-computed shard (no filesystem scanning), filters
+    already-processed samples, loads images in parallel, and enqueues batches.
+    Terminates with a ('done', stats_dict) sentinel.
+    """
     total_seen = 0
     already_done = 0
     key_counts: dict[str, int] = {}
@@ -82,7 +96,7 @@ def _prefetch_worker(
 
     try:
         with ThreadPoolExecutor(max_workers=num_io_workers) as pool:
-            for sample in preprocessor.iter_samples_for_rank(rank, world_size):
+            for sample in shard:
                 total_seen += 1
                 key = preprocessor.stats_key(sample)
                 key_counts[key] = key_counts.get(key, 0) + 1
@@ -109,13 +123,13 @@ def _prefetch_worker(
 
 
 # ---------------------------------------------------------------------------
-# Per-GPU worker (spawned by torch.multiprocessing.spawn)
+# Per-GPU worker (spawned by torch.multiprocessing)
 # ---------------------------------------------------------------------------
 
 def _gpu_worker(
     rank: int,
-    world_size: int,
     jobs: list,
+    pre_scanned: list,
     encoder_ckpt: str,
     batch_size: int,
     num_io_workers: int,
@@ -125,7 +139,12 @@ def _gpu_worker(
 ) -> None:
     """
     Runs in a subprocess — one per GPU.
-    Processes all jobs sequentially, then puts per-job stats into result_queue.
+
+    pre_scanned: list of dicts, one per job, each containing:
+        'shard'         — list[SampleMeta] for this rank (pre-split in main)
+        'processed_set' — set[str] of already-existing .pt paths (pre-built in main)
+        'dataset_name'  — str
+        'output_root'   — str
     """
     device = torch.device(f"cuda:{rank}")
     torch.cuda.set_device(device)
@@ -142,11 +161,11 @@ def _gpu_worker(
                 fullgraph=False,
             )
         except Exception:
-            pass  # fall back silently
+            pass
 
     job_results = []
 
-    for job in jobs:
+    for job, scan in zip(jobs, pre_scanned):
         preprocessor_cls = PREPROCESSORS[job["type"]]
         try:
             preprocessor = preprocessor_cls(
@@ -156,7 +175,10 @@ def _gpu_worker(
         except TypeError:
             preprocessor = preprocessor_cls(job["image_dir"], str(job["output_root"]))
 
-        processed_set: set[str] = set(preprocessor.build_processed_set())
+        shard = scan["shard"]
+        # Copy so new writes this run can be tracked locally without affecting
+        # the shared object (which is read-only from the worker's perspective).
+        processed_set: set[str] = set(scan["processed_set"])
 
         t0 = time.time()
         written_local = 0
@@ -166,13 +188,14 @@ def _gpu_worker(
             disable=(rank != 0),
             dynamic_ncols=True,
             unit="frames",
+            total=len(shard),
         )
 
         prefetch_q: queue.Queue = queue.Queue(maxsize=prefetch_batches)
         producer = threading.Thread(
             target=_prefetch_worker,
-            args=(preprocessor, rank, world_size, batch_size,
-                  num_io_workers, processed_set, prefetch_q),
+            args=(preprocessor, shard, batch_size, num_io_workers,
+                  processed_set, prefetch_q),
             daemon=True,
         )
         producer.start()
@@ -206,16 +229,60 @@ def _gpu_worker(
 
         elapsed = time.time() - t0
         job_results.append({
-            'dataset_name': preprocessor.dataset_name,
-            'output_root': str(job["output_root"]),
-            'total_seen': producer_stats['total_seen'],
+            'dataset_name': scan["dataset_name"],
+            'output_root':  scan["output_root"],
+            'total_seen':   producer_stats['total_seen'],
             'already_done': producer_stats['already_done'],
-            'key_counts': producer_stats['key_counts'],
-            'written': written_local,
-            'elapsed': elapsed,
+            'key_counts':   producer_stats['key_counts'],
+            'written':      written_local,
+            'elapsed':      elapsed,
         })
 
     result_queue.put((rank, job_results))
+
+
+# ---------------------------------------------------------------------------
+# Pre-scan: runs once in main process before any worker is spawned
+# ---------------------------------------------------------------------------
+
+def _prescan_job(job: dict, num_gpus: int) -> list[dict]:
+    """
+    Build the preprocessor, scan source + output dirs ONCE, and return
+    num_gpus dicts — one per rank — each containing:
+        shard         list[SampleMeta]  — this rank's share of the dataset
+        processed_set set[str]          — existing .pt paths (shared snapshot)
+        dataset_name  str
+        output_root   str
+    """
+    preprocessor_cls = PREPROCESSORS[job["type"]]
+    try:
+        preprocessor = preprocessor_cls(
+            job["image_dir"], str(job["output_root"]),
+            name=job["name"], **job["extra"],
+        )
+    except TypeError:
+        preprocessor = preprocessor_cls(job["image_dir"], str(job["output_root"]))
+
+    print(f"[{preprocessor.dataset_name}] Scanning source dataset ...")
+    all_samples = list(preprocessor.iter_samples())
+    print(f"[{preprocessor.dataset_name}] Found {len(all_samples):,} frames — splitting across {num_gpus} GPUs")
+
+    # Modulo interleaving — same partitioning as iter_samples_for_rank
+    shards = [all_samples[i::num_gpus] for i in range(num_gpus)]
+
+    print(f"[{preprocessor.dataset_name}] Scanning existing embeddings ...")
+    processed_set = set(preprocessor.build_processed_set())
+    print(f"[{preprocessor.dataset_name}] {len(processed_set):,} frames already done — will skip")
+
+    return [
+        {
+            "shard":         shards[rank],
+            "processed_set": processed_set,
+            "dataset_name":  preprocessor.dataset_name,
+            "output_root":   str(job["output_root"]),
+        }
+        for rank in range(num_gpus)
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -289,7 +356,19 @@ def main():
         f"prefetch={args.prefetch_batches} | {compile_tag}"
     )
 
-    # Use 'spawn' context — required for CUDA multiprocessing
+    # --- Pre-scan all jobs ONCE before spawning any workers -----------------
+    # pre_scanned[job_idx][rank] = {shard, processed_set, dataset_name, output_root}
+    pre_scanned_by_job = []
+    for job in jobs:
+        pre_scanned_by_job.append(_prescan_job(job, num_gpus))
+
+    # Reorganise to pre_scanned_by_rank[rank] = list of per-job scan dicts
+    pre_scanned_by_rank = [
+        [pre_scanned_by_job[job_idx][rank] for job_idx in range(len(jobs))]
+        for rank in range(num_gpus)
+    ]
+
+    # --- Spawn one process per GPU ------------------------------------------
     ctx = tmp.get_context("spawn")
     result_queue = ctx.Queue()
 
@@ -297,7 +376,7 @@ def main():
     for rank in range(num_gpus):
         p = ctx.Process(
             target=_gpu_worker,
-            args=(rank, num_gpus, jobs, args.encoder_ckpt,
+            args=(rank, jobs, pre_scanned_by_rank[rank], args.encoder_ckpt,
                   args.batch_size, args.num_io_workers, args.prefetch_batches,
                   result_queue, args.compile),
             daemon=False,
@@ -305,7 +384,7 @@ def main():
         p.start()
         processes.append(p)
 
-    # Collect results from all workers
+    # --- Collect results ----------------------------------------------------
     all_rank_results = {}
     for _ in range(num_gpus):
         rank, job_results = result_queue.get()
@@ -314,12 +393,9 @@ def main():
     for p in processes:
         p.join()
 
-    # Aggregate stats across ranks per job
-    num_jobs = len(jobs)
+    # --- Aggregate stats per job --------------------------------------------
     all_stats = []
-
-    for job_idx in range(num_jobs):
-        job = jobs[job_idx]
+    for job_idx, job in enumerate(jobs):
         dataset_name = None
         output_root = None
         total_seen = 0
@@ -332,7 +408,7 @@ def main():
             r = all_rank_results[rank][job_idx]
             dataset_name = r['dataset_name']
             output_root = Path(r['output_root'])
-            total_seen += r['total_seen']
+            total_seen   += r['total_seen']
             total_written += r['written']
             total_skipped += r['already_done']
             max_elapsed = max(max_elapsed, r['elapsed'])
@@ -346,11 +422,11 @@ def main():
         )
 
         stats = DatasetStats(dataset_name=dataset_name)
-        stats.total_frames = total_seen
-        stats.skipped_frames = total_skipped
-        stats.frames_per_group = merged_key_counts
+        stats.total_frames            = total_seen
+        stats.skipped_frames          = total_skipped
+        stats.frames_per_group        = merged_key_counts
         stats.processing_time_seconds = max_elapsed
-        stats.output_size_bytes = compute_output_size(output_root, dataset_name)
+        stats.output_size_bytes       = compute_output_size(output_root, dataset_name)
 
         print_dataset_stats(stats)
         save_stats(stats, output_root)
