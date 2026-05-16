@@ -18,25 +18,25 @@ output_root: /share/project/congsheng/all-qwen-embeddings-event-all-256
 datasets:
   # ── Single-camera datasets (camera_key: image) ──────────────────────────
 
-  - name: EgoExoLearn
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/EgoExoLearn
-    type: lerobot_without_text
+  # - name: EgoExoLearn
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/EgoExoLearn
+  #   type: lerobot_without_text
 
-  - name: Gen-EgoData
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/Gen-EgoData
-    type: lerobot_without_text
+  # - name: Gen-EgoData
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/Gen-EgoData
+  #   type: lerobot_without_text
 
-  - name: agibot_world
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/agibot_world
-    type: lerobot_without_text
+  # - name: agibot_world
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/agibot_world
+  #   type: lerobot_without_text
 
-  - name: ego4d1
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/ego4d1
-    type: lerobot_without_text
+  # - name: ego4d1
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/ego4d1
+  #   type: lerobot_without_text
 
-  - name: egocentric10k
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/egocentric10k
-    type: lerobot_without_text
+  # - name: egocentric10k
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/egocentric10k
+  #   type: lerobot_without_text
 
   - name: egodex
     image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/egodex
@@ -62,9 +62,9 @@ datasets:
     image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/llava-178k
     type: lerobot_without_text
 
-  - name: llava-178k-ex
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/llava-178k-ex
-    type: lerobot_without_text
+  # - name: llava-178k-ex
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/llava-178k-ex
+  #   type: lerobot_without_text
 
   - name: pe_video_extended
     image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/pe_video_extended
@@ -86,10 +86,10 @@ datasets:
   # galbot_real has: left_head, left_wrist, right_head, right_wrist
   # Add extra entries below (with different name) to embed additional views.
 
-  - name: galbot_real
-    image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/galbot_real
-    type: lerobot_without_text
-    camera_key: left_head
+  # - name: galbot_real
+  #   image_dir: /share/project/hotel/lerobot_multiimage_data_1fps/event/galbot_real
+  #   type: lerobot_without_text
+  #   camera_key: left_head
 
   # agibot_world_multiview has: hand_left_color, hand_right_color, head_color
 

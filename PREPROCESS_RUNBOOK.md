@@ -249,3 +249,6 @@ export NCCL_DEBUG=INFO
 | `scripts/monitor_nodes.sh` | Live status / tmux monitor / log tailing |
 | `scripts/preprocess_config.yaml` | Dataset list and output root |
 | `scripts/preprocess_embeddings.py` | Main Python entry point |
+
+
+python scripts/preprocess_single_node.py --config scripts/preprocess_config.yaml  --encoder_ckpt /share/project/congsheng/qwen_visual/qwen3_5_visual_encoder_4b.pt --num_gpus 8 --num_io_workers 64 --batch_size 128

@@ -180,7 +180,7 @@ class QwenVisualEncoder(nn.Module):
         visual.load_state_dict(ckpt["state_dict"])
         visual = visual.to(torch.bfloat16)
 
-        processor = AutoProcessor.from_pretrained(ckpt["processor_name"])
+        processor = AutoProcessor.from_pretrained("/share/project/congsheng/model/hub/models--Qwen--Qwen3.5-4B/snapshots/851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", local_files_only=True)
         return cls(visual, processor, hidden_size)
 
     # ------------------------------------------------------------------
