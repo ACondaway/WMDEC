@@ -7,16 +7,25 @@ Streaming / chunked version with:
     - ONE-TIME processed_set scan
     - incremental processed_set updates
     - no torch.distributed / NCCL
+    - persistent GPU workers (encoder loaded once per GPU, never reloaded)
 
 Pipeline
 --------
-dataset start:
-    scan existing embeddings ONCE
+startup:
+    spawn N GPU workers (one per GPU)
+    each worker loads encoder ONCE and signals ready
 
-loop:
-    scan next chunk
-    process chunk
-    update processed_set incrementally
+dataset loop:
+    scan existing embeddings ONCE
+    chunk loop:
+        scan next chunk
+        dispatch chunk shard to each persistent worker via task queue
+        collect results from result queue
+        update processed_set incrementally
+
+shutdown:
+    send poison pill to each worker
+    join all worker processes
 """
 
 import os
@@ -153,24 +162,31 @@ def _prefetch_worker(
 
 
 # ---------------------------------------------------------------------------
-# Per-GPU worker
+# Persistent per-GPU worker
+#
+# Loads the encoder ONCE at startup, signals "ready", then loops on
+# task_queue processing one chunk shard at a time.  Each task is a
+# (job, scan) tuple; None is the poison pill that causes the worker to exit.
 # ---------------------------------------------------------------------------
 
 def _gpu_worker(
     rank: int,
-    jobs: list,
-    pre_scanned: list,
     encoder_ckpt: str,
+    task_queue: mp.Queue,
+    result_queue: mp.Queue,
+    compile_encoder: bool,
     batch_size: int,
     num_io_workers: int,
     prefetch_batches: int,
-    result_queue: mp.Queue,
-    compile_encoder: bool,
 ) -> None:
 
     device = torch.device(f"cuda:{rank}")
 
     torch.cuda.set_device(device)
+
+    # ------------------------------------------------------------------
+    # Load encoder once — stays resident for all chunks / datasets
+    # ------------------------------------------------------------------
 
     encoder = QwenVisualEncoder.from_standalone(
         encoder_ckpt
@@ -192,9 +208,22 @@ def _gpu_worker(
         except Exception:
             pass
 
-    job_results = []
+    # Signal that this worker is ready
+    result_queue.put((rank, "ready", None))
 
-    for job, scan in zip(jobs, pre_scanned):
+    # ------------------------------------------------------------------
+    # Task loop — process chunks until poison pill
+    # ------------------------------------------------------------------
+
+    while True:
+
+        task = task_queue.get()
+
+        if task is None:
+            # Poison pill — shut down cleanly
+            break
+
+        job, scan = task
 
         preprocessor_cls = PREPROCESSORS[job["type"]]
 
@@ -254,6 +283,7 @@ def _gpu_worker(
         producer.start()
 
         producer_stats = None
+        producer_error = None
 
         while True:
 
@@ -299,9 +329,9 @@ def _gpu_worker(
 
                 producer.join(timeout=5)
 
-                raise RuntimeError(
-                    f"Prefetch worker on GPU {rank} raised: {item[1]}"
-                )
+                producer_error = item[1]
+
+                break
 
         producer.join()
 
@@ -309,25 +339,34 @@ def _gpu_worker(
 
         elapsed = time.time() - t0
 
-        job_results.append(
-            {
-                "dataset_name": scan["dataset_name"],
-                "output_root": scan["output_root"],
-                "total_seen": producer_stats["total_seen"],
-                "already_done": producer_stats["already_done"],
-                "key_counts": producer_stats["key_counts"],
-                "written": written_local,
-                "elapsed": elapsed,
-                "new_paths": new_paths,
-            }
-        )
+        if producer_error is not None:
 
-    result_queue.put(
-        (
-            rank,
-            job_results,
-        )
-    )
+            result_queue.put(
+                (
+                    rank,
+                    "error",
+                    f"Prefetch worker on GPU {rank} raised: {producer_error}",
+                )
+            )
+
+        else:
+
+            result_queue.put(
+                (
+                    rank,
+                    "chunk_done",
+                    {
+                        "dataset_name": scan["dataset_name"],
+                        "output_root": scan["output_root"],
+                        "total_seen": producer_stats["total_seen"],
+                        "already_done": producer_stats["already_done"],
+                        "key_counts": producer_stats["key_counts"],
+                        "written": written_local,
+                        "elapsed": elapsed,
+                        "new_paths": new_paths,
+                    },
+                )
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +634,53 @@ def main():
     )
 
     # -----------------------------------------------------------------------
+    # Spawn persistent GPU workers (encoder loaded ONCE per GPU)
+    # -----------------------------------------------------------------------
+
+    ctx = tmp.get_context("spawn")
+
+    result_queue = ctx.Queue()
+
+    task_queues = [ctx.Queue() for _ in range(num_gpus)]
+
+    processes = []
+
+    print(f"Spawning {num_gpus} persistent GPU worker(s) and loading encoder ...")
+
+    for rank in range(num_gpus):
+
+        p = ctx.Process(
+            target=_gpu_worker,
+            args=(
+                rank,
+                args.encoder_ckpt,
+                task_queues[rank],
+                result_queue,
+                args.compile,
+                args.batch_size,
+                args.num_io_workers,
+                args.prefetch_batches,
+            ),
+            daemon=False,
+        )
+
+        p.start()
+
+        processes.append(p)
+
+    # Wait until all workers have loaded the encoder and signalled ready
+    for _ in range(num_gpus):
+
+        rank, msg, _ = result_queue.get()
+
+        if msg != "ready":
+            raise RuntimeError(
+                f"GPU {rank} sent unexpected startup message: {msg}"
+            )
+
+    print(f"All {num_gpus} GPU worker(s) ready — encoder resident on each GPU.")
+
+    # -----------------------------------------------------------------------
     # Process datasets sequentially
     # -----------------------------------------------------------------------
 
@@ -670,7 +756,7 @@ def main():
         dataset_done = False
 
         # -------------------------------------------------------------------
-        # Chunk loop
+        # Chunk loop — dispatch to persistent workers via task queues
         # -------------------------------------------------------------------
 
         while not dataset_done:
@@ -686,62 +772,34 @@ def main():
             if pre_scanned is None:
                 break
 
-            pre_scanned_by_rank = [
-                pre_scanned[rank]
-                for rank in range(num_gpus)
-            ]
-
-            # ---------------------------------------------------------------
-            # Spawn workers
-            # ---------------------------------------------------------------
-
-            ctx = tmp.get_context("spawn")
-
-            result_queue = ctx.Queue()
-
-            processes = []
-
+            # Dispatch one shard to each persistent worker
             for rank in range(num_gpus):
 
-                p = ctx.Process(
-                    target=_gpu_worker,
-                    args=(
-                        rank,
-                        [job],
-                        [pre_scanned_by_rank[rank]],
-                        args.encoder_ckpt,
-                        args.batch_size,
-                        args.num_io_workers,
-                        args.prefetch_batches,
-                        result_queue,
-                        args.compile,
-                    ),
-                    daemon=False,
+                task_queues[rank].put(
+                    (job, pre_scanned[rank])
                 )
 
-                p.start()
-
-                processes.append(p)
-
-            # ---------------------------------------------------------------
-            # Collect results
-            # ---------------------------------------------------------------
-
+            # Collect results from all workers
             all_rank_results = {}
 
             for _ in range(num_gpus):
 
-                rank, job_results = result_queue.get()
+                rank, msg, payload = result_queue.get()
 
-                all_rank_results[rank] = job_results[0]
+                if msg == "error":
 
-            for p in processes:
-                p.join()
+                    # Shut down remaining workers before raising
+                    for tq in task_queues:
+                        tq.put(None)
 
-            # ---------------------------------------------------------------
+                    for p in processes:
+                        p.join(timeout=30)
+
+                    raise RuntimeError(payload)
+
+                all_rank_results[rank] = payload
+
             # Aggregate stats
-            # ---------------------------------------------------------------
-
             for rank in range(num_gpus):
 
                 r = all_rank_results[rank]
@@ -761,7 +819,7 @@ def main():
                     r["elapsed"],
                 )
 
-                # incremental processed_set update
+                # Incremental processed_set update
                 processed_set.update(
                     r["new_paths"]
                 )
@@ -780,12 +838,7 @@ def main():
                 f"processed_set={len(processed_set):,}"
             )
 
-            # ---------------------------------------------------------------
-            # Cleanup
-            # ---------------------------------------------------------------
-
             del pre_scanned
-            del pre_scanned_by_rank
             del all_rank_results
 
             torch.cuda.empty_cache()
@@ -818,6 +871,16 @@ def main():
         save_stats(stats, output_root)
 
         all_stats.append(stats)
+
+    # -----------------------------------------------------------------------
+    # Shut down persistent workers
+    # -----------------------------------------------------------------------
+
+    for tq in task_queues:
+        tq.put(None)
+
+    for p in processes:
+        p.join()
 
     # -----------------------------------------------------------------------
     # Combined stats
