@@ -1,0 +1,51 @@
+# SD3.5 Phase 1 — Semantic Alignment Training Config
+# Trains: PerceiverResampler + ResidualMLPAdaptor
+# Frozen: SD3.5 MMDiT, VAE, Qwen Visual Encoder
+
+# ── Backbone paths ───────────────────────────────────────────────────────────
+transformer_path: /share/project/congsheng/checkpoints/stable-diffusion-3.5-medium
+vae_path:         /share/project/congsheng/checkpoints/stable-diffusion-3.5-medium
+qwen_encoder_ckpt: /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
+
+# ── Semantic condition branch ─────────────────────────────────────────────────
+resampler:
+  in_dim:      2560   # Qwen output dim
+  hidden_dim:  1024
+  num_queries: 32
+  num_heads:   8
+  num_layers:  4
+  ff_mult:     4
+
+adaptor:
+  in_dim:     1024   # matches resampler hidden_dim
+  out_dim:    4096   # SD3.5 joint_attention_dim
+  pooled_dim: 2048   # SD3.5 pooled_projection_dim
+  num_blocks: 6
+  ff_mult:    4
+
+# ── Semantic alignment loss ───────────────────────────────────────────────────
+# Set > 0.0 to enable L_align = 1 - cos(z_qwen_pred, z_qwen_orig)
+sem_loss_weight: 0.0
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+resolution: 768
+rebalance_alpha: 0.7
+
+datasets:
+  - name: robobrain-dex
+    embedding_dir: /share/project/congsheng/robobrain-dex-qwen-embedding
+    image_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex
+
+# ── Training ──────────────────────────────────────────────────────────────────
+per_gpu_batch:  8          # 8 GPUs × 8 = 64 global batch (768 res)
+grad_accum:     1
+total_steps:    100000
+warmup_steps:   1000
+lr:             1.0e-4
+weight_decay:   1.0e-2
+num_workers:    8
+
+# ── Logging / checkpointing ───────────────────────────────────────────────────
+log_every:  50
+save_every: 2000
+output_dir: outputs/sd35_phase1

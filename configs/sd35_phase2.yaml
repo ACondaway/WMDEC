@@ -1,0 +1,58 @@
+# SD3.5 Phase 2 — Texture Control Training Config
+# Trains: TextureControlBranch + PerceiverResampler + ResidualMLPAdaptor (continued)
+# Frozen: SD3.5 MMDiT, VAE, Qwen Visual Encoder
+# Requires: phase1 checkpoint to initialise semantic branch weights
+
+# ── Backbone paths ───────────────────────────────────────────────────────────
+transformer_path: /share/project/congsheng/checkpoints/stable-diffusion-3.5-medium
+vae_path:         /share/project/congsheng/checkpoints/stable-diffusion-3.5-medium
+qwen_encoder_ckpt: /share/project/congsheng/checkpoints/qwen3_5_visual_encoder_4b.pt
+
+# ── Semantic condition branch (same config as Phase 1) ───────────────────────
+resampler:
+  in_dim:      2560
+  hidden_dim:  1024
+  num_queries: 32
+  num_heads:   8
+  num_layers:  4
+  ff_mult:     4
+
+adaptor:
+  in_dim:     1024
+  out_dim:    4096
+  pooled_dim: 2048
+  num_blocks: 6
+  ff_mult:    4
+
+# ── Texture control branch ────────────────────────────────────────────────────
+control:
+  latent_channels: 16     # SD3.5 VAE produces 16-channel latents
+  ctrl_dim:        512    # internal control feature dim
+  pooled_dim:      2048   # SD3.5 pooled_projection_dim (must match adaptor)
+  drop_prob:       0.5    # stochastic control dropout (training only)
+
+# ── Semantic alignment loss ───────────────────────────────────────────────────
+sem_loss_weight: 0.1
+
+# ── Dataset ───────────────────────────────────────────────────────────────────
+resolution: 768
+rebalance_alpha: 0.7
+
+datasets:
+  - name: robobrain-dex
+    embedding_dir: /share/project/congsheng/robobrain-dex-qwen-embedding
+    image_dir: /share/project/hotel/lerobot30_multiimage_data_1fps/robobrain-dex
+
+# ── Training ──────────────────────────────────────────────────────────────────
+per_gpu_batch:  8
+grad_accum:     1
+total_steps:    200000
+warmup_steps:   500
+lr:             5.0e-5      # lower LR than Phase 1 (fine-tuning regime)
+weight_decay:   1.0e-2
+num_workers:    8
+
+# ── Logging / checkpointing ───────────────────────────────────────────────────
+log_every:  50
+save_every: 2000
+output_dir: outputs/sd35_phase2
